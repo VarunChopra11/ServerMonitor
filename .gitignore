@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Local configuration
+.env
+.env.*
+*.local
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime files
+*.pid
+
+# Temporary files
+*.tmp
+*.swp
