@@ -183,6 +183,22 @@ class Config:
     def modules(self):
         return self.data.get("modules", self.DEFAULT_CONFIG["modules"])
 
+    @property
+    def trusted_proxies(self):
+        return self.data.get("trusted_proxies", self.DEFAULT_CONFIG["trusted_proxies"])
+
+    @property
+    def monitored_systemd_units(self):
+        return self.data.get("monitored_systemd_units", self.DEFAULT_CONFIG["monitored_systemd_units"])
+
+    @property
+    def monitored_processes(self):
+        return self.data.get("monitored_processes", self.DEFAULT_CONFIG["monitored_processes"])
+
+    @property
+    def monitored_http_urls(self):
+        return self.data.get("monitored_http_urls", self.DEFAULT_CONFIG["monitored_http_urls"])
+
 
 # ============================================================
 # SECURITY & AUTHENTICATION
@@ -198,7 +214,10 @@ def verify_token(expected_token, provided_token):
 
 
 def extract_token(headers, path=""):
-    """Extracts authentication token from Authorization header, X-Monitor-Token, or query param."""
+    """
+    Extracts authentication token strictly from secure headers (Authorization or X-Monitor-Token).
+    URL query-string token authentication is intentionally not supported to prevent credential leakage.
+    """
     # Check Authorization: Bearer <token>
     auth_header = headers.get("authorization", "") if hasattr(headers, "get") else ""
     if auth_header.lower().startswith("bearer "):
@@ -208,21 +227,6 @@ def extract_token(headers, path=""):
     custom_header = headers.get("x-monitor-token", "") if hasattr(headers, "get") else ""
     if custom_header:
         return custom_header.strip()
-
-    # Check query string (?token=...)
-    if "?" in path:
-        query_part = path.split("?", 1)[1]
-        for param in query_part.split("&"):
-            if param.startswith("token="):
-                return param.split("=", 1)[1].strip()
-
-    # Check Cookie header
-    cookie_header = headers.get("cookie", "") if hasattr(headers, "get") else ""
-    if "monitor_token=" in cookie_header:
-        for c in cookie_header.split(";"):
-            c = c.strip()
-            if c.startswith("monitor_token="):
-                return c.split("=", 1)[1].strip()
 
     return ""
 
@@ -241,26 +245,48 @@ def get_security_headers():
 
 
 class RateLimiter:
-    """Sliding-window in-memory IP rate limiter."""
+    """Sliding-window in-memory IP rate limiter with bounded memory and automatic cleanup."""
 
-    def __init__(self, max_requests=60, window_seconds=60.0):
+    def __init__(self, max_requests=60, window_seconds=60.0, max_clients=10000):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
+        self.max_clients = max_clients
         self.clients = {}
         self.lock = threading.Lock()
 
     def allow_request(self, client_ip):
         now = time.monotonic()
         with self.lock:
+            # Capacity guard: prune expired entries if map grows large
+            if len(self.clients) >= self.max_clients:
+                self._prune_unlocked(now)
+                # If still over limit, evict oldest entries
+                if len(self.clients) >= self.max_clients:
+                    keys_to_remove = list(self.clients.keys())[:max(1, self.max_clients // 5)]
+                    for k in keys_to_remove:
+                        del self.clients[k]
+
             timestamps = self.clients.get(client_ip, [])
-            # Prune old timestamps
             valid_timestamps = [t for t in timestamps if now - t < self.window_seconds]
+
             if len(valid_timestamps) >= self.max_requests:
                 self.clients[client_ip] = valid_timestamps
                 return False
+
             valid_timestamps.append(now)
             self.clients[client_ip] = valid_timestamps
             return True
+
+    def _prune_unlocked(self, now):
+        dead_keys = [k for k, ts in self.clients.items() if not ts or (now - ts[-1] >= self.window_seconds)]
+        for k in dead_keys:
+            del self.clients[k]
+
+    def cleanup(self):
+        """Explicitly purges expired IP entries."""
+        now = time.monotonic()
+        with self.lock:
+            self._prune_unlocked(now)
 
 
 _global_rate_limiter = RateLimiter(max_requests=120, window_seconds=60.0)
@@ -365,7 +391,7 @@ def get_uptime():
 # ============================================================
 
 def get_cpu_usage():
-    """Backward-compatible total CPU percentage calculator."""
+    """Backward-compatible total CPU percentage calculator avoiding guest double-counting."""
     global _previous_cpu
 
     try:
@@ -378,8 +404,11 @@ def get_cpu_usage():
         if not values:
             return 0.0
 
+        # In Linux /proc/stat, guest is already accounted in user, and guest_nice in nice.
+        # Sum only the first 8 fields (user, nice, system, idle, iowait, irq, softirq, steal)
+        # to avoid double-counting guest/guest_nice.
+        total = sum(values[:8]) if len(values) >= 8 else sum(values)
         idle = values[3] + (values[4] if len(values) > 4 else 0)
-        total = sum(values)
         current = (total, idle)
 
         if _previous_cpu is None:
@@ -441,7 +470,8 @@ def get_cpu_stats():
 
     current_snapshot = {}
     for name, vals in parsed.items():
-        total = sum(vals)
+        # In Linux /proc/stat, guest is already accounted in user, and guest_nice in nice.
+        total = sum(vals[:8]) if len(vals) >= 8 else sum(vals)
         idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
         steal = vals[7] if len(vals) > 7 else 0
         current_snapshot[name] = {
@@ -588,7 +618,7 @@ def get_storage():
 
 
 def get_storage_mounts():
-    """Discovers and inspects all real mounted storage filesystems."""
+    """Discovers and inspects all real mounted storage filesystems including ZFS, NFS, and CIFS."""
     mounts = []
     seen_mounts = set()
 
@@ -597,7 +627,8 @@ def get_storage_mounts():
         "proc", "sysfs", "devpts", "devtmpfs", "tmpfs", "securityfs",
         "cgroup", "cgroup2", "pstore", "bpf", "configfs", "autofs",
         "mqueue", "hugetlbfs", "debugfs", "tracefs", "fusectl", "ramfs",
-        "binfmt_misc", "nsfs", "efivarfs", "squashfs", "rpc_pipefs", "rootfs"
+        "binfmt_misc", "nsfs", "efivarfs", "squashfs", "rpc_pipefs", "rootfs",
+        "pipefs", "sockfs", "anon_inodefs"
     }
 
     try:
@@ -615,8 +646,8 @@ def get_storage_mounts():
             if mountpoint.startswith("/snap") or (device.startswith("/dev/loop") and mountpoint != "/"):
                 continue
 
-            # Must be a real device or root mount
-            if not (device.startswith("/dev") or mountpoint == "/"):
+            # Skip dummy device markers unless root
+            if device in ("none", "nodev") and mountpoint != "/":
                 continue
 
             if mountpoint in seen_mounts:
@@ -673,11 +704,13 @@ def get_storage_mounts():
 # ============================================================
 
 def get_network():
-    """Universal network traffic inspection with accurate delta calculation."""
+    """Universal network traffic inspection with accurate delta calculation and virtual interface filtering."""
     rx = 0
     tx = 0
     interfaces = {}
+    virtual_prefixes = ("lo", "veth", "docker", "br-", "virbr", "vnet", "dummy", "tun", "tap", "flannel", "cni", "calico", "tailscale", "wg")
 
+    raw_ifaces = {}
     try:
         with open("/proc/net/dev", "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -692,14 +725,29 @@ def get_network():
                 if len(values) >= 9:
                     iface_rx = int(values[0])
                     iface_tx = int(values[8])
-                    rx += iface_rx
-                    tx += iface_tx
-                    interfaces[interface] = {
-                        "rx": iface_rx,
-                        "tx": iface_tx
-                    }
+                    raw_ifaces[interface] = (iface_rx, iface_tx)
     except (OSError, ValueError):
         pass
+
+    # Detect physical hardware devices backed by /sys/class/net/<iface>/device
+    has_physical = any(os.path.exists(f"/sys/class/net/{iface}/device") for iface in raw_ifaces)
+
+    for iface, (iface_rx, iface_tx) in raw_ifaces.items():
+        is_virt = iface.startswith(virtual_prefixes)
+        interfaces[iface] = {
+            "rx": iface_rx,
+            "tx": iface_tx,
+            "is_virtual": is_virt
+        }
+
+        # Aggregate traffic without double-counting:
+        # If physical devices are detected, aggregate only physical interfaces.
+        # Otherwise (containers / VMs), aggregate all non-virtual interfaces.
+        is_phys = os.path.exists(f"/sys/class/net/{iface}/device")
+        should_aggregate = is_phys if has_physical else (not is_virt)
+        if should_aggregate:
+            rx += iface_rx
+            tx += iface_tx
 
     global _previous_network
     global _previous_sample_time
@@ -724,7 +772,8 @@ def get_network():
                         "rx_rate": round(irx, 1),
                         "tx_rate": round(itx, 1),
                         "rx_total": data["rx"],
-                        "tx_total": data["tx"]
+                        "tx_total": data["tx"],
+                        "is_virtual": data.get("is_virtual", False)
                     }
 
     _previous_network = {
@@ -734,12 +783,16 @@ def get_network():
     }
     _previous_sample_time = now
 
-    # Determine primary interface
+    # Determine primary interface: prefer physical/non-virtual with highest traffic
     primary = "eth0"
-    if iface_rates:
-        primary = max(iface_rates.keys(), key=lambda k: iface_rates[k]["rx_rate"] + iface_rates[k]["tx_rate"])
-    elif interfaces:
-        primary = max(interfaces.keys(), key=lambda k: interfaces[k]["rx"] + interfaces[k]["tx"])
+    candidates = iface_rates or interfaces
+    if candidates:
+        non_virt = [k for k in candidates.keys() if not candidates[k].get("is_virtual", False)]
+        search_pool = non_virt if non_virt else list(candidates.keys())
+        if iface_rates:
+            primary = max(search_pool, key=lambda k: iface_rates[k]["rx_rate"] + iface_rates[k]["tx_rate"])
+        else:
+            primary = max(search_pool, key=lambda k: interfaces[k]["rx"] + interfaces[k]["tx"])
 
     return {
         "rx": rx,
@@ -936,16 +989,47 @@ def get_process_status(process_name):
     return False
 
 
+def get_monitored_processes(process_names=None):
+    """Inspects configured process list directly via /proc in pure Python."""
+    global _global_config
+    if process_names is None:
+        process_names = _global_config.monitored_processes if _global_config else ["sshd"]
+
+    results = {p: {"running": False, "count": 0, "pids": []} for p in process_names}
+    if not os.path.exists("/proc"):
+        return results
+
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            comm = read_file(f"/proc/{pid}/comm").strip()
+            if comm in results:
+                results[comm]["running"] = True
+                results[comm]["count"] += 1
+                if len(results[comm]["pids"]) < 5:
+                    results[comm]["pids"].append(pid)
+    except OSError:
+        pass
+
+    return results
+
+
 def get_systemd_service_status(service_name):
-    """Inspects a systemd service state in a strictly read-only manner."""
-    if not os.path.exists("/run/systemd/system"):
+    """Inspects a single systemd service state in a strictly read-only manner."""
+    if not os.path.exists("/run/systemd/system") or not shutil.which("systemctl"):
         return "unavailable"
+    clean_name = "".join(c for c in service_name if c.isalnum() or c in "@-_.")
+    if not clean_name:
+        return "unknown"
     try:
         proc = subprocess.run(
-            ["systemctl", "is-active", service_name],
+            ["systemctl", "is-active", clean_name],
             capture_output=True,
             text=True,
-            timeout=2
+            timeout=2,
+            shell=False
         )
         out = proc.stdout.strip()
         if proc.returncode == 0 and out == "active":
@@ -953,6 +1037,166 @@ def get_systemd_service_status(service_name):
         return out or "inactive"
     except Exception:
         return "unknown"
+
+
+def get_systemd_services(units=None):
+    """Inspects configured systemd units in a strictly read-only manner."""
+    global _global_config
+    if units is None:
+        units = _global_config.monitored_systemd_units if _global_config else ["ssh", "sshd", "nginx", "caddy", "docker"]
+
+    if not os.path.exists("/run/systemd/system") or not shutil.which("systemctl"):
+        return {"available": False, "units": {}}
+
+    results = {}
+    for unit in units:
+        clean_unit = "".join(c for c in unit if c.isalnum() or c in "@-_.")
+        if not clean_unit:
+            continue
+        try:
+            proc = subprocess.run(
+                ["systemctl", "is-active", clean_unit],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                shell=False
+            )
+            state = proc.stdout.strip() or ("active" if proc.returncode == 0 else "inactive")
+            results[clean_unit] = state
+        except Exception:
+            results[clean_unit] = "unknown"
+
+    return {"available": True, "units": results}
+
+
+def get_health_checks(endpoints=None):
+    """Performs lightweight HTTP and TCP endpoint health checks."""
+    global _global_config
+    if endpoints is None:
+        endpoints = _global_config.monitored_http_urls if _global_config else []
+
+    results = []
+    for ep in endpoints:
+        if isinstance(ep, str):
+            ep = {"name": ep, "url": ep}
+        name = ep.get("name", "Endpoint")
+        url = ep.get("url")
+        check_type = ep.get("type", "http")
+        timeout = float(ep.get("timeout", 2.0))
+
+        if check_type == "tcp" or (not url and "port" in ep):
+            host = ep.get("host", "127.0.0.1")
+            port = int(ep.get("port", 80))
+            t_start = time.monotonic()
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    latency = round((time.monotonic() - t_start) * 1000.0, 1)
+                    results.append({
+                        "name": name,
+                        "status": "up",
+                        "latency_ms": latency,
+                        "type": "tcp",
+                        "target": f"{host}:{port}"
+                    })
+            except Exception as e:
+                results.append({
+                    "name": name,
+                    "status": "down",
+                    "error": str(e),
+                    "type": "tcp",
+                    "target": f"{host}:{port}"
+                })
+        elif url:
+            t_start = time.monotonic()
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "ServerMonitor/2.0-HealthCheck"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    latency = round((time.monotonic() - t_start) * 1000.0, 1)
+                    code = resp.getcode()
+                    results.append({
+                        "name": name,
+                        "status": "up" if code < 400 else "warn",
+                        "code": code,
+                        "latency_ms": latency,
+                        "type": "http",
+                        "target": url
+                    })
+            except Exception as e:
+                results.append({
+                    "name": name,
+                    "status": "down",
+                    "error": str(e),
+                    "type": "http",
+                    "target": url
+                })
+
+    return results
+
+
+def get_docker_containers():
+    """Inspects Docker and Podman containers in a strictly read-only manner."""
+    runtime = shutil.which("docker") or shutil.which("podman")
+    if not runtime:
+        return {
+            "available": False,
+            "runtime": None,
+            "error": "Docker/Podman binary not found",
+            "containers": []
+        }
+
+    bin_name = os.path.basename(runtime)
+    try:
+        proc = subprocess.run(
+            [runtime, "ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.State}}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            shell=False
+        )
+        if proc.returncode != 0:
+            return {
+                "available": False,
+                "runtime": bin_name,
+                "error": proc.stderr.strip() or f"Exited with code {proc.returncode}",
+                "containers": []
+            }
+
+        containers = []
+        running = 0
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            cid = parts[0] if len(parts) > 0 else ""
+            cname = parts[1] if len(parts) > 1 else ""
+            cimg = parts[2] if len(parts) > 2 else ""
+            cstatus = parts[3] if len(parts) > 3 else ""
+            cstate = parts[4] if len(parts) > 4 else ("running" if "Up" in cstatus else "exited")
+            if cstate.lower() == "running" or "Up" in cstatus:
+                running += 1
+            containers.append({
+                "id": cid[:12],
+                "name": cname,
+                "image": cimg,
+                "status": cstatus,
+                "state": cstate.lower()
+            })
+
+        return {
+            "available": True,
+            "runtime": bin_name,
+            "total": len(containers),
+            "running": running,
+            "containers": containers
+        }
+    except Exception as e:
+        return {
+            "available": False,
+            "runtime": bin_name,
+            "error": str(e),
+            "containers": []
+        }
 
 
 def get_pm2_services():
@@ -1130,10 +1374,11 @@ def get_agy_executable():
     path = shutil.which("agy")
     if path:
         return path
+    user_home = os.environ.get("HOME") or os.path.expanduser("~")
     for candidate in [
-        "/home/server/.local/bin/agy",
-        os.path.expanduser("~/.local/bin/agy"),
+        os.path.join(user_home, ".local", "bin", "agy"),
         "/usr/local/bin/agy",
+        "/usr/bin/agy",
     ]:
         if os.path.exists(candidate) and os.access(candidate, os.X_OK):
             return candidate
@@ -1154,7 +1399,7 @@ def run_llm_usage():
     try:
         agy_bin = get_agy_executable()
         env = os.environ.copy()
-        user_home = os.path.expanduser("~server") if os.path.exists("/home/server") else os.path.expanduser("~")
+        user_home = os.environ.get("HOME") or os.path.expanduser("~")
         local_bin = os.path.join(user_home, ".local", "bin")
         if local_bin not in env.get("PATH", ""):
             env["PATH"] = f"{local_bin}:{env.get('PATH', '')}"
@@ -1253,6 +1498,10 @@ def get_status(client_id=None):
         "services": {
             "sshd": get_process_status("sshd"),
             "pm2": get_pm2_services(),
+            "systemd": get_systemd_services(),
+            "processes": get_monitored_processes(),
+            "health_checks": get_health_checks(),
+            "docker": get_docker_containers(),
         },
         "timestamp": time.time(),
         "collector_state": "standalone"
@@ -1350,6 +1599,10 @@ class OnDemandCollector:
         services = {
             "sshd": get_process_status("sshd"),
             "pm2": get_pm2_services(),
+            "systemd": get_systemd_services(),
+            "processes": get_monitored_processes(),
+            "health_checks": get_health_checks(),
+            "docker": get_docker_containers(),
         }
 
         # Calculate memory percentage
@@ -2006,6 +2259,10 @@ body {
                 </div>
                 <!-- Dynamic PM2 container required by tests -->
                 <div id="pm2Services" style="display: flex; flex-direction: column; gap: 8px;"></div>
+                <div id="systemdServices" style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;"></div>
+                <div id="customProcesses" style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;"></div>
+                <div id="healthChecksList" style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;"></div>
+                <div id="dockerContainersList" style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;"></div>
             </div>
         </div>
 
@@ -2128,8 +2385,8 @@ function renderSparkline(svgId, points, color) {
     });
 
     svg.innerHTML = `
-        <path class="sparkline-path" d="${d}" style="stroke: ${color};" />
-        <path class="sparkline-area" d="${d} L ${w},${h} L 0,${h} Z" style="fill: ${color}15;" />
+        <path class="sparkline-path" d="${d}" stroke="${color}" fill="none" stroke-width="1.5" />
+        <path class="sparkline-area" d="${d} L ${w},${h} L 0,${h} Z" fill="${color}" fill-opacity="0.15" stroke="none" />
     `;
 }
 
@@ -2139,6 +2396,7 @@ function renderSparkline(svgId, points, color) {
 
 async function update() {
     if (isUpdating) return;
+    if (document.hidden) return;
     isUpdating = true;
 
     try {
@@ -2344,11 +2602,104 @@ async function update() {
             sshdBadge.textContent = sshdActive ? "Active" : "Inactive";
         }
 
-        // 9. Sparkline Charts
+        // Systemd Services
+        const sysdContainer = document.getElementById("systemdServices");
+        const sysd = (data.services && data.services.systemd) || {};
+        if (sysdContainer && sysd.available && sysd.units) {
+            const unitKeys = Object.keys(sysd.units);
+            if (unitKeys.length > 0) {
+                sysdContainer.innerHTML = unitKeys.map(unit => {
+                    const state = sysd.units[unit];
+                    const isActive = state === "active";
+                    const badgeClass = isActive ? "online" : "offline";
+                    return `
+                        <div class="service-item">
+                            <span class="service-name">${escapeHtml(unit)} <small style="color:var(--muted);">(systemd)</small></span>
+                            <span class="service-badge ${badgeClass}">${escapeHtml(state)}</span>
+                        </div>
+                    `;
+                }).join("");
+            } else {
+                sysdContainer.innerHTML = "";
+            }
+        }
+
+        // Monitored Processes
+        const procContainer = document.getElementById("customProcesses");
+        const procs = (data.services && data.services.processes) || {};
+        if (procContainer) {
+            const procKeys = Object.keys(procs).filter(k => k !== "sshd");
+            if (procKeys.length > 0) {
+                procContainer.innerHTML = procKeys.map(name => {
+                    const pinfo = procs[name];
+                    const isRunning = pinfo && pinfo.running;
+                    const badgeClass = isRunning ? "online" : "offline";
+                    const countStr = isRunning ? `(${pinfo.count} proc)` : "";
+                    return `
+                        <div class="service-item">
+                            <span class="service-name">${escapeHtml(name)} <small style="color:var(--muted);">${countStr}</small></span>
+                            <span class="service-badge ${badgeClass}">${isRunning ? "Running" : "Stopped"}</span>
+                        </div>
+                    `;
+                }).join("");
+            } else {
+                procContainer.innerHTML = "";
+            }
+        }
+
+        // HTTP/TCP Health Checks
+        const hcContainer = document.getElementById("healthChecksList");
+        const checks = (data.services && data.services.health_checks) || [];
+        if (hcContainer) {
+            if (checks.length > 0) {
+                hcContainer.innerHTML = checks.map(c => {
+                    const isUp = c.status === "up";
+                    const badgeClass = isUp ? "online" : (c.status === "warn" ? "warning" : "offline");
+                    const latency = c.latency_ms !== undefined ? `(${c.latency_ms} ms)` : "";
+                    return `
+                        <div class="service-item">
+                            <span class="service-name">${escapeHtml(c.name)} <small style="color:var(--muted);">${latency}</small></span>
+                            <span class="service-badge ${badgeClass}">${escapeHtml(c.status.toUpperCase())}</span>
+                        </div>
+                    `;
+                }).join("");
+            } else {
+                hcContainer.innerHTML = "";
+            }
+        }
+
+        // Docker Containers
+        const dkrContainer = document.getElementById("dockerContainersList");
+        const dkr = (data.services && data.services.docker) || {};
+        if (dkrContainer && dkr.available && Array.isArray(dkr.containers)) {
+            if (dkr.containers.length > 0) {
+                dkrContainer.innerHTML = `
+                    <div style="font-size:11px;font-weight:600;color:var(--muted);margin-top:4px;">
+                        ${escapeHtml(dkr.runtime || "Container")} (${dkr.running}/${dkr.total} running)
+                    </div>
+                ` + dkr.containers.map(c => {
+                    const isRunning = c.state === "running";
+                    const badgeClass = isRunning ? "online" : "offline";
+                    return `
+                        <div class="service-item">
+                            <span class="service-name">
+                                <span>${escapeHtml(c.name)}</span>
+                                <span class="service-meta">(${escapeHtml(c.image)})</span>
+                            </span>
+                            <span class="service-badge ${badgeClass}">${escapeHtml(c.state)}</span>
+                        </div>
+                    `;
+                }).join("");
+            } else {
+                dkrContainer.innerHTML = "";
+            }
+        }
+
+        // 9. Sparkline Charts with standard hex colors
         if (data.history) {
-            renderSparkline("cpuSparkline", data.history.cpu, "var(--blue)");
-            renderSparkline("memorySparkline", data.history.memory, "var(--green)");
-            renderSparkline("networkSparkline", data.history.rx_rate, "var(--purple)");
+            renderSparkline("cpuSparkline", data.history.cpu, "#58a6ff");
+            renderSparkline("memorySparkline", data.history.memory, "#3fb950");
+            renderSparkline("networkSparkline", data.history.rx_rate, "#bc8cff");
         }
 
     } catch (err) {
@@ -2516,8 +2867,38 @@ class Handler(BaseHTTPRequestHandler):
         provided_token = extract_token(self.headers, self.path)
         return verify_token(expected_token, provided_token)
 
+    def get_client_ip(self):
+        global _global_config
+        peer_ip = self.client_address[0] if self.client_address else "127.0.0.1"
+        trusted = set(_global_config.trusted_proxies) if _global_config and hasattr(_global_config, "trusted_proxies") else {"127.0.0.1", "::1"}
+
+        # Immediate peer must be in trusted_proxies to inspect any forwarding headers.
+        # This completely prevents header spoofing by direct untrusted clients.
+        if peer_ip not in trusted:
+            return peer_ip
+
+        # Check X-Forwarded-For: "client, proxy1, proxy2"
+        xff = self.headers.get("x-forwarded-for")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            # Walk right-to-left to locate the first untrusted client IP
+            for candidate in reversed(parts):
+                if candidate not in trusted:
+                    return candidate
+            if parts:
+                return parts[0]
+
+        # Check X-Real-IP
+        x_real = self.headers.get("x-real-ip")
+        if x_real and x_real.strip():
+            candidate = x_real.strip()
+            if candidate not in trusted:
+                return candidate
+
+        return peer_ip
+
     def check_rate_limit(self, limiter):
-        client_ip = self.client_address[0] if self.client_address else "127.0.0.1"
+        client_ip = self.get_client_ip()
         return limiter.allow_request(client_ip)
 
     def do_GET(self):
@@ -2679,6 +3060,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
+
+# Isolated Writable State Paths
+StateDirectory=servermonitor
+ReadWritePaths={working_dir}
 
 [Install]
 WantedBy=multi-user.target
@@ -2866,16 +3251,40 @@ def main():
         return
 
     if args.status:
-        # Check if local port responds
-        test_port = args.port or DEFAULT_PORT
-        test_host = args.host or "127.0.0.1"
+        # Load configuration to resolve host, port, and authentication token
+        cfg = Config(config_file=args.config)
+        test_port = args.port or cfg.port or DEFAULT_PORT
+        test_host = args.host or cfg.host or "127.0.0.1"
+        token = args.token or cfg.auth_token or ""
+
+        url = f"http://{test_host}:{test_port}/api/config"
+        headers = {"User-Agent": f"ServerMonitor/{VERSION}-CLI"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-Monitor-Token"] = token
+
+        req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(f"http://{test_host}:{test_port}/api/config", timeout=2) as resp:
+            with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
-                print(f"[✓] ServerMonitor is running on http://{test_host}:{test_port} (v{data.get('version', '2.0')})")
+                auth_str = " (Authenticated)" if token else ""
+                print(f"[✓] ServerMonitor is running on http://{test_host}:{test_port}{auth_str} (v{data.get('version', VERSION)})")
                 return
-        except Exception:
-            print(f"[✗] ServerMonitor does not appear to be running on http://{test_host}:{test_port}")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                if token:
+                    print(f"[!] ServerMonitor is running on http://{test_host}:{test_port}, but provided token was rejected (HTTP {e.code}).")
+                else:
+                    print(f"[✓] ServerMonitor is running on http://{test_host}:{test_port} (Protected - HTTP {e.code} Unauthorized). Use --token <secret> to authenticate.")
+                return
+            else:
+                print(f"[!] ServerMonitor returned HTTP {e.code} on http://{test_host}:{test_port}")
+                sys.exit(1)
+        except urllib.error.URLError as e:
+            print(f"[✗] ServerMonitor is not running or unreachable on http://{test_host}:{test_port} ({e.reason})")
+            sys.exit(1)
+        except Exception as e:
+            print(f"[✗] Error connecting to ServerMonitor on http://{test_host}:{test_port}: {e}")
             sys.exit(1)
 
     # Load configuration

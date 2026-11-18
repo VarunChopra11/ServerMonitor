@@ -181,6 +181,110 @@ tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,size=819200k,mode=755 0 0
         self.assertFalse(bat["available"])
         self.assertIsNone(bat["capacity"])
 
+    @patch("server.read_file")
+    @patch("server.os.statvfs")
+    def test_zfs_nfs_cifs_mount_discovery(self, mock_statvfs, mock_read):
+        mounts_data = """rootfs / rootfs rw 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+/dev/sda1 / ext4 rw,relatime 0 0
+tank/data /mnt/zfs zfs rw,xattr,noacl 0 0
+192.168.1.10:/exports/media /mnt/nfs nfs4 rw,relatime 0 0
+//nas.local/backups /mnt/smb cifs rw,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev 0 0
+"""
+        mock_read.side_effect = lambda p: mounts_data if p == "/proc/mounts" else ""
+
+        def fake_stat(p):
+            if p in ("/", "/mnt/zfs", "/mnt/nfs", "/mnt/smb"):
+                return MagicMock(f_blocks=5000000, f_bavail=3000000, f_frsize=4096)
+            raise OSError("no mount")
+
+        mock_statvfs.side_effect = fake_stat
+
+        disks = server.get_storage_mounts()
+        mount_points = [d["mount"] for d in disks]
+        self.assertIn("/", mount_points)
+        self.assertIn("/mnt/zfs", mount_points)
+        self.assertIn("/mnt/nfs", mount_points)
+        self.assertIn("/mnt/smb", mount_points)
+
+        # Pseudo filesystems must not be included
+        self.assertNotIn("/sys", mount_points)
+        self.assertNotIn("/proc", mount_points)
+        self.assertNotIn("/run", mount_points)
+        self.assertNotIn("/sys/fs/cgroup", mount_points)
+
+        # Check types
+        zfs_disk = [d for d in disks if d["mount"] == "/mnt/zfs"][0]
+        self.assertEqual(zfs_disk["fstype"], "zfs")
+        self.assertEqual(zfs_disk["device"], "tank/data")
+
+        nfs_disk = [d for d in disks if d["mount"] == "/mnt/nfs"][0]
+        self.assertEqual(nfs_disk["fstype"], "nfs4")
+
+        smb_disk = [d for d in disks if d["mount"] == "/mnt/smb"][0]
+        self.assertEqual(smb_disk["fstype"], "cifs")
+
+    @patch("server.open")
+    @patch("server.os.path.exists")
+    def test_network_virtual_interface_filtering(self, mock_exists, mock_open_fn):
+        dev_content = """Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 100000       10    0    0    0     0          0         0   100000       10    0    0    0     0       0          0
+  eth0: 5000000      500    0    0    0     0          0         0  2000000      300    0    0    0     0       0          0
+docker0: 5000000      500    0    0    0     0          0         0  2000000      300    0    0    0     0       0          0
+veth12: 5000000      500    0    0    0     0          0         0  2000000      300    0    0    0     0       0          0
+"""
+        from io import StringIO
+        mock_open_fn.return_value = StringIO(dev_content)
+
+        # Only eth0 has /sys/class/net/eth0/device
+        mock_exists.side_effect = lambda p: p == "/sys/class/net/eth0/device"
+
+        # Reset previous network state
+        server._previous_network = None
+        server._previous_sample_time = None
+
+        net = server.get_network()
+
+        # The total rx and tx should ONLY count eth0 (5000000 and 2000000)
+        # It must NOT sum docker0 and veth12, which would triple-count to 15000000!
+        self.assertEqual(net["rx"], 5000000)
+        self.assertEqual(net["tx"], 2000000)
+        self.assertEqual(net["primary"], "eth0")
+
+        # But per-interface details must still be available
+        self.assertIn("docker0", net["interfaces"])
+        self.assertIn("veth12", net["interfaces"])
+        self.assertTrue(net["interfaces"]["docker0"]["is_virtual"])
+        self.assertTrue(net["interfaces"]["veth12"]["is_virtual"])
+        self.assertFalse(net["interfaces"]["eth0"]["is_virtual"])
+
+    @patch("server.read_file")
+    def test_cpu_guest_time_calculation(self, mock_read):
+        # Linux /proc/stat: user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+        # Note: guest (100) is already in user (500), guest_nice (50) is already in nice (200).
+        stat_sample_1 = "cpu  500 200 100 4000 50 10 20 50 100 50\n"
+        stat_sample_2 = "cpu  600 250 150 4100 60 15 25 60 120 60\n"
+
+        server._previous_cpu = None
+        server._previous_cpu_detailed = None
+
+        mock_read.return_value = stat_sample_1
+        stats1 = server.get_cpu_stats()
+
+        mock_read.return_value = stat_sample_2
+        stats2 = server.get_cpu_stats()
+
+        # Fields 0..7 delta: (600-500) + (250-200) + (150-100) + (4100-4000) + (60-50) + (15-10) + (25-20) + (60-50)
+        # = 100 + 50 + 50 + 100 + 10 + 5 + 5 + 10 = 330 ticks.
+        # Idle delta: (4100-4000) + (60-50) = 110 ticks.
+        # If guest (120-100 = 20) and guest_nice (60-50 = 10) were incorrectly added, total would be 360 ticks.
+        # With correct total (330 ticks): usage = (1 - 110/330) * 100 = 66.7%
+        self.assertAlmostEqual(stats2["usage"], 66.7, delta=0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

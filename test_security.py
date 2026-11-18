@@ -29,11 +29,55 @@ class TestSecurityAndAuth(unittest.TestCase):
         headers_custom = {"x-monitor-token": "custom-token-555"}
         self.assertEqual(server.extract_token(headers_custom, ""), "custom-token-555")
 
-        # Query param
-        self.assertEqual(server.extract_token({}, "/api/status?token=query-token-111"), "query-token-111")
+        # Query param tokens must be rejected/ignored for security
+        self.assertEqual(server.extract_token({}, "/api/status?token=query-token-111"), "")
 
         # Missing token
         self.assertEqual(server.extract_token({}, "/api/status"), "")
+
+    def test_trusted_proxy_forwarding(self):
+        # Setup config with trusted proxies
+        server._global_config = server.Config()
+        server._global_config.data["trusted_proxies"] = ["127.0.0.1", "::1"]
+
+        class DummyHandler:
+            def __init__(self, client_ip, headers):
+                self.client_address = (client_ip, 12345)
+                self.headers = headers
+            get_client_ip = server.Handler.get_client_ip
+
+        # 1. Direct untrusted client trying to spoof X-Forwarded-For -> Ignored!
+        direct_handler = DummyHandler("203.0.113.195", {"x-forwarded-for": "10.0.0.1"})
+        self.assertEqual(direct_handler.get_client_ip(), "203.0.113.195")
+
+        # 2. Trusted proxy forwarding single client IP -> Accepted
+        proxy_handler = DummyHandler("127.0.0.1", {"x-forwarded-for": "198.51.100.42"})
+        self.assertEqual(proxy_handler.get_client_ip(), "198.51.100.42")
+
+        # 3. Trusted proxy forwarding proxy chain -> First untrusted client found
+        chain_handler = DummyHandler("127.0.0.1", {"x-forwarded-for": "198.51.100.99, 127.0.0.1"})
+        self.assertEqual(chain_handler.get_client_ip(), "198.51.100.99")
+
+        # 4. Trusted proxy using X-Real-IP
+        xreal_handler = DummyHandler("127.0.0.1", {"x-real-ip": "198.51.100.77"})
+        self.assertEqual(xreal_handler.get_client_ip(), "198.51.100.77")
+
+    def test_rate_limiter_cleanup_and_bounding(self):
+        limiter = server.RateLimiter(max_requests=5, window_seconds=0.1, max_clients=10)
+
+        # Fill with multiple IPs
+        for i in range(15):
+            limiter.allow_request(f"10.0.0.{i}")
+
+        # Ensure memory structure remains bounded under many unique client IPs
+        self.assertLessEqual(len(limiter.clients), 10)
+
+        # Wait for window expiry
+        time.sleep(0.15)
+
+        # Cleanup should prune all expired entries
+        limiter.cleanup()
+        self.assertEqual(len(limiter.clients), 0)
 
     def test_speedtest_lock_and_cooldown(self):
         server._speedtest_lock = server.threading.Lock()

@@ -56,6 +56,39 @@ class TestOnDemandCollector(unittest.TestCase):
         self.assertIn("memory", history)
         self.assertLessEqual(len(history["cpu"]), self.collector.history_maxlen)
 
+    def test_multiple_tabs_and_disconnected_sessions(self):
+        self.collector.start()
+
+        # Two tabs active simultaneously
+        self.collector.touch_session("tab-1")
+        self.collector.touch_session("tab-2")
+        self.assertTrue(self.collector.is_active())
+
+        # Tab 1 closes or becomes hidden
+        self.collector.unregister_session("tab-1")
+        # Collector must still be active because tab-2 is connected
+        self.assertTrue(self.collector.is_active())
+
+        # Tab 2 unregisters / closes
+        self.collector.unregister_session("tab-2")
+        # Now no sessions active -> collector becomes idle
+        self.assertFalse(self.collector.is_active())
+        self.assertEqual(self.collector.get_state(), "idle")
+
+        # Tab returns -> immediate resumption
+        self.collector.touch_session("tab-1")
+        self.assertTrue(self.collector.is_active())
+        self.assertEqual(self.collector.get_state(), "active")
+
+    def test_frontend_html_inactivity_and_sparkline_fixes(self):
+        html = server.HTML
+        # Must check document.hidden inside update() to stop background tab polling
+        self.assertIn("if (document.hidden) return;", html)
+        self.assertIn("visibilitychange", html)
+        # Sparkline area must not have invalid CSS ${color}15 concatenation
+        self.assertNotIn("${color}15", html)
+        self.assertIn('fill-opacity="0.15"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

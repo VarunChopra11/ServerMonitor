@@ -14,9 +14,10 @@ A production-ready, ultra-lightweight, universal Linux server monitoring applica
 - **On-Demand Live Monitoring**: Sampling begins **only when an authenticated dashboard session is actively connected**. When all sessions close or become inactive, the background collector pauses automatically—dropping daemon CPU usage to **0.0%**.
 - **Universal Hardware & Cloud Support**: Dynamically detects CPU architecture (`x86_64`, `aarch64`, `riscv64`), CPU model, cores, per-core utilization, and **CPU steal time** (essential for cloud VMs).
 - **Container & Cgroup Aware**: Detects cgroup v1 and cgroup v2 memory limits (Docker, Podman, LXC, Kubernetes) and visualizes container resource constraints alongside host RAM.
-- **Dynamic Mounts & Storage**: Discovers all mounted physical block devices and filesystems (`ext4`, `xfs`, `btrfs`, `zfs`, `f2fs`) instead of hardcoding root.
+- **Dynamic Mounts & Storage**: Discovers all mounted physical block devices and filesystems (`ext4`, `xfs`, `btrfs`, `zfs`, `f2fs`, `nfs`, `cifs`) instead of hardcoding root.
 - **Adaptive Sensor UI**: Automatically displays hardware thermals (`/sys/class/thermal`, `/sys/class/hwmon`) and battery status (`/sys/class/power_supply`) when present; **gracefully collapses** those widgets on cloud VMs and hypervisors without clutter.
-- **Security by Default**: Binds to `127.0.0.1` by default, supports constant-time token authentication (`hmac.compare_digest`), injects strict CSP/security headers, enforces rate limits, and applies speed test mutex locks with mandatory cooldowns.
+- **Multi-Service & Container Health**: Configurable monitoring for systemd units, background processes, HTTP/TCP endpoints, and Docker/Podman containers.
+- **Security by Default**: Binds to `127.0.0.1` by default, supports constant-time token authentication (`hmac.compare_digest`), injects strict CSP/security headers, enforces rate limits, validates reverse-proxy client IPs, and applies speed test mutex locks with mandatory cooldowns.
 - **Microscopic Resource Footprint**: Zero third-party dependencies (`pip install` not required). Consumes only **~28 MB RAM** and negligible CPU overhead.
 - **Interactive CLI Setup Wizard**: Includes `setup`, `run`, `status`, `tunnel`, `benchmark`, `systemd`, `pm2`, and `uninstall` commands.
 
@@ -37,21 +38,22 @@ A production-ready, ultra-lightweight, universal Linux server monitoring applica
 |    +--------------------+--------+--------+--------------------+        |
 |    |                    |                 |                    |        |
 |    v                    v                 v                    v        |
-| Hardware Engine     Memory / Cgroup   Storage Mounts     Process Health |
-|  - CPU Model/Arch    - Host RAM        - Real Block Fs    - SSH status  |
-|  - Per-Core Usage    - cgroup v1/v2    - Ext4/XFS/Btrfs   - PM2 jlist   |
-|  - CPU Steal %       - Swap usage      - Dynamic statvfs  - Systemd     |
-|  - Thermals / SoC                                                       |
+| Hardware Engine     Memory / Cgroup   Storage Mounts     Services / Docker  |
+|  - CPU Model/Arch    - Host RAM        - Real Block Fs    - SSH status       |
+|  - Per-Core Usage    - cgroup v1/v2    - Ext4/XFS/Btrfs   - PM2 jlist        |
+|  - CPU Steal %       - Swap usage      - ZFS / NFS / CIFS - Systemd units    |
+|  - Thermals / SoC                      - Dynamic statvfs  - Docker / Podman  |
 |                                                                         |
 |  +-------------------------------------------------------------------+  |
 |  |           Thread-Safe HTTP Server & Security Middleware           |  |
 |  |   - Constant-Time Token Auth (hmac.compare_digest)                |  |
 |  |   - Strict Security Headers (CSP, nosniff, DENY, no-referrer)    |  |
-|  |   - Sliding-Window IP Rate Limiter & Speedtest Mutex Cooldown     |  |
+|  |   - Sliding-Window IP Rate Limiter & Trusted Reverse Proxy Checks  |  |
+|  |   - Speedtest Mutex Cooldown & On-Demand Lifecycle Manager        |  |
 |  +-------------------------------------------------------------------+  |
 +-------------------------------------------------------------------------+
                                    ^
-                                   | (HTTP / SSE / JSON API)
+                                   | (On-Demand HTTP Polling / REST JSON API)
                                    v
              [ Browser Dashboard / SSH Tunnel / Tailscale ]
 ```
@@ -218,11 +220,10 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # WebSocket & SSE streaming support
+        # HTTP connection keepalive & buffer options
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 86400;
+        proxy_set_header Connection "";
+        proxy_read_timeout 60;
     }
 
     listen 443 ssl;

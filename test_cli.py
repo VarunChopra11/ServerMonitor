@@ -47,6 +47,53 @@ class TestCliAndConfig(unittest.TestCase):
         self.assertIn("ExecStart=/usr/bin/python3 /opt/servermonitor/server.py", unit)
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("NoNewPrivileges=true", unit)
+        # Must isolate writable state and paths
+        self.assertIn("StateDirectory=servermonitor", unit)
+        self.assertIn("ReadWritePaths=", unit)
+
+    def test_status_cli_handling(self):
+        from unittest.mock import patch, MagicMock
+        import io
+
+        # 1. Unauthenticated server running (HTTP 200)
+        with patch("sys.argv", ["server.py", "--status", "--port", "9999"]), \
+             patch("urllib.request.urlopen") as mock_url, \
+             patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({"version": "2.0.0"}).encode()
+            mock_url.return_value.__enter__.return_value = mock_resp
+            server.main()
+            self.assertIn("[✓] ServerMonitor is running", mock_out.getvalue())
+
+        # 2. Protected server running with valid token (HTTP 200 with Bearer)
+        with patch("sys.argv", ["server.py", "--status", "--port", "9999", "--token", "secret123"]), \
+             patch("urllib.request.urlopen") as mock_url, \
+             patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({"version": "2.0.0"}).encode()
+            mock_url.return_value.__enter__.return_value = mock_resp
+            server.main()
+            self.assertIn("[✓] ServerMonitor is running", mock_out.getvalue())
+            self.assertIn("Authenticated", mock_out.getvalue())
+
+        # 3. Protected server running without token -> reports Protected, NOT that server is dead!
+        from urllib.error import HTTPError
+        with patch("sys.argv", ["server.py", "--status", "--port", "9999"]), \
+             patch("urllib.request.urlopen", side_effect=HTTPError("http://127.0.0.1:9999/api/config", 401, "Unauthorized", {}, None)), \
+             patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            server.main()
+            self.assertIn("[✓] ServerMonitor is running", mock_out.getvalue())
+            self.assertIn("Protected - HTTP 401 Unauthorized", mock_out.getvalue())
+
+        # 4. Server completely unreachable -> exits with code 1
+        from urllib.error import URLError
+        with patch("sys.argv", ["server.py", "--status", "--port", "9999"]), \
+             patch("urllib.request.urlopen", side_effect=URLError("Connection refused")), \
+             patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            with self.assertRaises(SystemExit) as cm:
+                server.main()
+            self.assertEqual(cm.exception.code, 1)
+            self.assertIn("[✗] ServerMonitor is not running or unreachable", mock_out.getvalue())
 
 
 if __name__ == "__main__":
