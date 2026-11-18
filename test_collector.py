@@ -89,6 +89,35 @@ class TestOnDemandCollector(unittest.TestCase):
         self.assertNotIn("${color}15", html)
         self.assertIn('fill-opacity="0.15"', html)
 
+    def test_concurrent_initial_sampling(self):
+        """Verifies that multiple concurrent threads calling get_snapshot() on a fresh collector
+        safely synchronize without race conditions, crashes, or deadlocks."""
+        import threading
+        fresh_collector = server.OnDemandCollector(sample_interval=0.1, inactivity_timeout=1.0)
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                snap = fresh_collector.get_snapshot()
+                results.append(snap)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=3.0)
+
+        self.assertEqual(len(errors), 0, f"Thread errors: {errors}")
+        self.assertEqual(len(results), 10)
+        for snap in results:
+            self.assertIn("cpu", snap)
+            self.assertIn("memory", snap)
+            self.assertIn("history", snap)
+        fresh_collector.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

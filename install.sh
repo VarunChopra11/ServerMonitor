@@ -13,14 +13,20 @@ echo -e "${BLUE}============================================================${NC
 echo -e "${BLUE}        ServerMonitor v2.0 - Universal Linux Installer     ${NC}"
 echo -e "${BLUE}============================================================${NC}"
 
-# Check for Python 3
+# Check for Python 3.8+
 if ! command -v python3 >/dev/null 2>&1; then
-    echo -e "${RED}Error: python3 is not installed. Please install Python 3 before continuing.${NC}" >&2
+    echo -e "${RED}Error: python3 is not installed. Please install Python 3.8 or newer before continuing.${NC}" >&2
     exit 1
 fi
 
+PY_OK=$(python3 -c "import sys; print('1' if sys.version_info >= (3, 8) else '0')")
 PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-echo -e "Detected Python: ${GREEN}Python ${PY_VERSION}${NC}"
+
+if [ "$PY_OK" != "1" ]; then
+    echo -e "${RED}Error: ServerMonitor requires Python 3.8 or newer (detected Python ${PY_VERSION}).${NC}" >&2
+    exit 1
+fi
+echo -e "Detected Python: ${GREEN}Python ${PY_VERSION}${NC} (compatible)"
 
 # Determine installation directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,14 +61,35 @@ fi
 
 # Offer systemd installation if root and systemd active
 if [ "$EUID" -eq 0 ] && [ -d "/run/systemd/system" ]; then
-    read -p "Install as systemd service (/etc/systemd/system/servermonitor.service)? [Y/n] " install_systemd
-    install_systemd=${install_systemd:-Y}
-    if [[ "$install_systemd" =~ ^[Yy]$ ]]; then
-        python3 "$TARGET_DIR/server.py" --generate-systemd > /etc/systemd/system/servermonitor.service
-        systemctl daemon-reload
-        systemctl enable --now servermonitor.service
-        echo -e "${GREEN}[✓] ServerMonitor systemd service enabled and started.${NC}"
-        systemctl status servermonitor.service --no-pager
+    UNIT_FILE="/etc/systemd/system/servermonitor.service"
+    can_install_unit=true
+
+    if [ -f "$UNIT_FILE" ]; then
+        echo -e "\n${YELLOW}[!] An existing systemd service was detected at ${UNIT_FILE}.${NC}"
+        EXISTING_EXEC=$(grep -E "^ExecStart=" "$UNIT_FILE" | head -n1 | cut -d= -f2- || true)
+        echo -e "    Existing ExecStart: ${EXISTING_EXEC}"
+        if ! echo "$EXISTING_EXEC" | grep -q "$TARGET_DIR"; then
+            echo -e "${RED}[WARNING] The existing unit does NOT point to this installation ($TARGET_DIR).${NC}"
+            echo -e "Overwriting it may break an existing service or another installation."
+            read -p "Overwrite existing service anyway? [y/N]: " overwrite_unit
+            overwrite_unit=${overwrite_unit:-N}
+            if [[ ! "$overwrite_unit" =~ ^[Yy]$ ]]; then
+                echo "Skipping systemd installation to preserve the existing service."
+                can_install_unit=false
+            fi
+        fi
+    fi
+
+    if [ "$can_install_unit" = true ]; then
+        read -p "Install as systemd service (/etc/systemd/system/servermonitor.service)? [Y/n] " install_systemd
+        install_systemd=${install_systemd:-Y}
+        if [[ "$install_systemd" =~ ^[Yy]$ ]]; then
+            python3 "$TARGET_DIR/server.py" --generate-systemd > "$UNIT_FILE"
+            systemctl daemon-reload
+            systemctl enable --now servermonitor.service
+            echo -e "${GREEN}[✓] ServerMonitor systemd service enabled and started.${NC}"
+            systemctl status servermonitor.service --no-pager
+        fi
     fi
 fi
 

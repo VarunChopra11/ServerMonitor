@@ -105,6 +105,21 @@ class TestIntegrationLiveServer(unittest.TestCase):
             data = json.loads(resp.read().decode("utf-8"))
             self.assertEqual(data["status"], "ok")
 
+    def test_speedtest_endpoint_disabled_enforcement(self):
+        # Temporarily disable speedtest in config
+        self.config.data["speedtest_enabled"] = False
+        try:
+            url = f"http://{self.test_host}:{self.test_port}/api/speedtest"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.test_token}"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 403)
+            body = json.loads(ctx.exception.read().decode())
+            self.assertFalse(body["success"])
+            self.assertIn("disabled", body["error"])
+        finally:
+            self.config.data["speedtest_enabled"] = True
+
 
 if __name__ == "__main__":
     unittest.main()

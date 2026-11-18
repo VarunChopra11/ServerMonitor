@@ -160,6 +160,75 @@ d987e6f5c4b3\tdb\tpostgres:15\tExited (0) 10 minutes ago\texited
         self.assertIn("health_checks", svcs)
         self.assertIn("docker", svcs)
 
+    @patch("server.get_cpu_stats")
+    @patch("server.get_memory")
+    @patch("server.get_storage")
+    @patch("server.get_network")
+    @patch("server.get_thermal_details")
+    @patch("server.get_battery")
+    @patch("server.get_pm2_services")
+    @patch("server.get_systemd_services")
+    @patch("server.get_docker_containers")
+    def test_disabled_modules_not_collected(self, mock_dkr, mock_sysd, mock_pm2, mock_bat, mock_therm, mock_net, mock_stor, mock_mem, mock_cpu):
+        """Verifies that when module switches are False, collectors are not executed."""
+        cfg = server.Config()
+        cfg.data["modules"] = {
+            "cpu": False,
+            "memory": False,
+            "storage": False,
+            "network": False,
+            "thermals": False,
+            "battery": False,
+            "services": False,
+            "pm2": False,
+            "systemd": False,
+            "docker": False,
+            "antigravity": False
+        }
+
+        metrics = server.collect_system_metrics(cfg)
+
+        # None of the probe functions should be invoked
+        mock_cpu.assert_not_called()
+        mock_mem.assert_not_called()
+        mock_stor.assert_not_called()
+        mock_net.assert_not_called()
+        mock_therm.assert_not_called()
+        mock_bat.assert_not_called()
+        mock_pm2.assert_not_called()
+        mock_sysd.assert_not_called()
+        mock_dkr.assert_not_called()
+
+        # The returned metrics should report disabled state
+        self.assertTrue(metrics["cpu_details"]["disabled"])
+        self.assertTrue(metrics["memory"]["disabled"])
+        self.assertTrue(metrics["storage"]["disabled"])
+        self.assertTrue(metrics["network"]["disabled"])
+        self.assertTrue(metrics["thermal"]["disabled"])
+        self.assertTrue(metrics["battery"]["disabled"])
+        self.assertTrue(metrics["services"]["systemd"]["disabled"])
+        self.assertEqual(metrics["services"]["pm2"]["status"], "disabled")
+        self.assertTrue(metrics["services"]["docker"]["disabled"])
+
+    def test_speedtest_and_antigravity_disabled_enforcement(self):
+        """Verifies that speed test and antigravity usage are blocked when disabled in config."""
+        from unittest.mock import patch
+
+        cfg = server.Config()
+        cfg.data["speedtest_enabled"] = False
+        cfg.data["modules"]["antigravity"] = False
+
+        with patch("server._global_config", cfg):
+            # Speed test must return failure indicating disabled
+            st_res = server.run_speed_test()
+            self.assertFalse(st_res["success"])
+            self.assertIn("disabled", st_res["error"])
+
+            # Antigravity must return failure indicating disabled
+            llm_res = server.run_llm_usage()
+            self.assertFalse(llm_res["success"])
+            self.assertIn("disabled", llm_res["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

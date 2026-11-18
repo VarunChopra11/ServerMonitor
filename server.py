@@ -7,6 +7,7 @@ VMs, VPS instances, bare-metal hardware, and containers.
 
 import argparse
 import collections
+import copy
 import hmac
 import json
 import os
@@ -20,6 +21,14 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Python version compatibility enforcement (Python 3.8+)
+if sys.version_info < (3, 8):
+    sys.stderr.write(
+        f"Error: ServerMonitor requires Python 3.8 or newer "
+        f"(detected Python {sys.version_info.major}.{sys.version_info.minor})\n"
+    )
+    sys.exit(1)
 
 # ============================================================
 # CONSTANTS & GLOBAL STATE
@@ -94,7 +103,7 @@ class Config:
 
     def __init__(self, config_file=None):
         self.config_file = config_file or self._find_config_file()
-        self.data = dict(self.DEFAULT_CONFIG)
+        self.data = copy.deepcopy(self.DEFAULT_CONFIG)
         if self.config_file and os.path.exists(self.config_file):
             self.load()
 
@@ -102,15 +111,35 @@ class Config:
         env_cfg = os.environ.get("SERVERMONITOR_CONFIG")
         if env_cfg and os.path.exists(env_cfg):
             return env_cfg
+
+        # Support systemd-provided state and configuration directories
+        for env_var in ("STATE_DIRECTORY", "CONFIGURATION_DIRECTORY"):
+            d = os.environ.get(env_var)
+            if d:
+                cfg_path = os.path.join(d, "config.json")
+                if os.path.exists(cfg_path):
+                    return cfg_path
+
         candidates = [
-            os.path.join(os.getcwd(), "config.json"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+            "/var/lib/servermonitor/config.json",
             "/etc/servermonitor/config.json",
             os.path.expanduser("~/.config/servermonitor/config.json"),
+            os.path.join(os.getcwd(), "config.json"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
         ]
         for c in candidates:
             if os.path.exists(c):
                 return c
+
+        if os.environ.get("STATE_DIRECTORY"):
+            return os.path.join(os.environ["STATE_DIRECTORY"], "config.json")
+        if os.environ.get("CONFIGURATION_DIRECTORY"):
+            return os.path.join(os.environ["CONFIGURATION_DIRECTORY"], "config.json")
+
+        if os.path.exists("/var/lib/servermonitor") and os.access("/var/lib/servermonitor", os.W_OK):
+            return "/var/lib/servermonitor/config.json"
+        if os.path.exists("/etc/servermonitor") and os.access("/etc/servermonitor", os.W_OK):
+            return "/etc/servermonitor/config.json"
         return os.path.join(os.getcwd(), "config.json")
 
     def load(self):
@@ -118,7 +147,12 @@ class Config:
             with open(self.config_file, "r") as f:
                 loaded = json.load(f)
                 if isinstance(loaded, dict):
-                    self.data.update(loaded)
+                    # Recursive deep merge for nested dictionaries
+                    for k, v in loaded.items():
+                        if isinstance(v, dict) and isinstance(self.data.get(k), dict):
+                            self.data[k].update(copy.deepcopy(v))
+                        else:
+                            self.data[k] = copy.deepcopy(v)
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to load config from {self.config_file}: {e}\n")
 
@@ -1288,7 +1322,17 @@ def get_pm2_services():
 
 def run_speed_test():
     """On-demand speed test protected by mutex and mandatory cooldown."""
-    global _speedtest_last_run
+    global _speedtest_last_run, _global_config
+
+    cfg = _global_config or Config()
+    if not cfg.speedtest_enabled:
+        return {
+            "success": False,
+            "download": None,
+            "upload": None,
+            "latency": None,
+            "error": "Speed test is disabled in server configuration",
+        }
 
     result = {
         "success": False,
@@ -1386,6 +1430,15 @@ def get_agy_executable():
 
 
 def run_llm_usage():
+    global _global_config
+    cfg = _global_config or Config()
+    if not cfg.modules.get("antigravity", True):
+        return {
+            "success": False,
+            "groups": [],
+            "error": "Antigravity module is disabled in configuration"
+        }
+
     result = {
         "success": False,
         "groups": [],
@@ -1462,23 +1515,113 @@ def run_llm_usage():
 # COMPLETE SYSTEM STATUS
 # ============================================================
 
-def get_status(client_id=None):
-    """Returns complete telemetry snapshot, waking collector if needed."""
-    global _global_collector
+def collect_system_metrics(cfg=None):
+    """Samples all enabled system telemetry modules according to configuration switches."""
+    global _global_config
+    cfg = cfg or _global_config or Config()
+    mods = cfg.modules
 
-    if _global_collector is not None:
-        if client_id:
-            _global_collector.touch_session(client_id)
-        return _global_collector.get_snapshot()
+    # CPU module
+    if mods.get("cpu", True):
+        cpu_info = get_cpu_stats()
+    else:
+        cpu_info = {
+            "usage": 0.0,
+            "steal": 0.0,
+            "cores": get_cpu_count(),
+            "per_core": [],
+            "model": "Disabled",
+            "load": [0.0, 0.0, 0.0],
+            "disabled": True
+        }
 
-    # Standalone direct snapshot if collector not initialized
-    cpu_info = get_cpu_stats()
-    memory = get_memory()
-    storage = get_storage()
-    disks = get_storage_mounts()
-    network = get_network()
-    thermal = get_thermal_details()
-    battery = get_battery()
+    # Memory module
+    if mods.get("memory", True):
+        memory = get_memory()
+    else:
+        memory = {
+            "total": 0,
+            "used": 0,
+            "available": 0,
+            "free": 0,
+            "buffers_cached": 0,
+            "swap_total": 0,
+            "swap_used": 0,
+            "container": {"active": False},
+            "disabled": True
+        }
+
+    # Storage module
+    if mods.get("storage", True):
+        storage = get_storage()
+        disks = get_storage_mounts()
+    else:
+        storage = {"total": 0, "used": 0, "free": 0, "disabled": True}
+        disks = []
+
+    # Network module
+    if mods.get("network", True):
+        network = get_network()
+    else:
+        network = {
+            "rx": 0,
+            "tx": 0,
+            "rx_rate": 0.0,
+            "tx_rate": 0.0,
+            "primary": "disabled",
+            "interfaces": {},
+            "disabled": True
+        }
+
+    # Thermals module
+    if mods.get("thermals", True):
+        thermal = get_thermal_details()
+    else:
+        thermal = {
+            "available": False,
+            "temperature": None,
+            "sensors": [],
+            "disabled": True
+        }
+
+    # Battery module
+    if mods.get("battery", True):
+        battery = get_battery()
+    else:
+        battery = {
+            "available": False,
+            "capacity": None,
+            "status": "Disabled",
+            "health": "N/A",
+            "voltage": None,
+            "current": None,
+            "temperature": None,
+            "technology": "N/A",
+            "disabled": True
+        }
+
+    # Services module
+    services = {}
+    if mods.get("services", True):
+        services["sshd"] = get_process_status("sshd")
+        services["pm2"] = get_pm2_services() if mods.get("pm2", True) else {"status": "disabled", "services": []}
+        services["systemd"] = get_systemd_services() if mods.get("systemd", True) else {"available": False, "units": {}, "disabled": True}
+        services["processes"] = get_monitored_processes()
+        services["health_checks"] = get_health_checks()
+        services["docker"] = get_docker_containers() if mods.get("docker", False) else {"available": False, "runtime": None, "disabled": True, "containers": []}
+    else:
+        services = {
+            "sshd": False,
+            "pm2": {"status": "disabled", "services": []},
+            "systemd": {"available": False, "units": {}, "disabled": True},
+            "processes": {},
+            "health_checks": [],
+            "docker": {"available": False, "runtime": None, "disabled": True, "containers": []}
+        }
+
+    mem_pct = 0.0
+    if memory.get("total", 0) > 0:
+        mem_pct = round((memory.get("used", 0) / memory["total"]) * 100, 1)
 
     return {
         "hostname": get_hostname(),
@@ -1488,6 +1631,7 @@ def get_status(client_id=None):
         "cpu_details": cpu_info,
         "load": cpu_info["load"],
         "memory": memory,
+        "mem_pct": mem_pct,
         "storage": storage,
         "disks": disks,
         "uptime": get_uptime(),
@@ -1495,17 +1639,24 @@ def get_status(client_id=None):
         "temperature": thermal["temperature"],
         "thermal": thermal,
         "battery": battery,
-        "services": {
-            "sshd": get_process_status("sshd"),
-            "pm2": get_pm2_services(),
-            "systemd": get_systemd_services(),
-            "processes": get_monitored_processes(),
-            "health_checks": get_health_checks(),
-            "docker": get_docker_containers(),
-        },
+        "services": services,
         "timestamp": time.time(),
-        "collector_state": "standalone"
     }
+
+
+def get_status(client_id=None):
+    """Returns complete telemetry snapshot, waking collector if needed."""
+    global _global_collector
+
+    if _global_collector is not None:
+        if client_id:
+            _global_collector.touch_session(client_id)
+        return _global_collector.get_snapshot()
+
+    snapshot = collect_system_metrics()
+    snapshot["collector_state"] = "standalone"
+    snapshot.pop("mem_pct", None)
+    return snapshot
 
 
 # ============================================================
@@ -1588,73 +1739,28 @@ class OnDemandCollector:
                 "tx_rate": list(self._history["tx_rate"]),
             }
 
+    def _sample_locked(self):
+        """Samples metrics while holding self._lock. Thread-safe and race-free."""
+        snapshot = collect_system_metrics()
+        mem_pct = snapshot.pop("mem_pct", 0.0)
+        snapshot["collector_state"] = self.get_state()
+
+        self._cached_snapshot = snapshot
+        self._history["cpu"].append(snapshot["cpu"])
+        self._history["memory"].append(mem_pct)
+        self._history["steal"].append(snapshot["cpu_details"]["steal"])
+        self._history["rx_rate"].append(snapshot["network"]["rx_rate"])
+        self._history["tx_rate"].append(snapshot["network"]["tx_rate"])
+
     def _sample(self):
-        cpu_info = get_cpu_stats()
-        memory = get_memory()
-        storage = get_storage()
-        disks = get_storage_mounts()
-        network = get_network()
-        thermal = get_thermal_details()
-        battery = get_battery()
-        services = {
-            "sshd": get_process_status("sshd"),
-            "pm2": get_pm2_services(),
-            "systemd": get_systemd_services(),
-            "processes": get_monitored_processes(),
-            "health_checks": get_health_checks(),
-            "docker": get_docker_containers(),
-        }
-
-        # Calculate memory percentage
-        mem_pct = 0.0
-        if memory["total"] > 0:
-            mem_pct = round((memory["used"] / memory["total"]) * 100, 1)
-
-        snapshot = {
-            "hostname": get_hostname(),
-            "architecture": get_cpu_architecture(),
-            "cpu": cpu_info["usage"],
-            "cpu_count": cpu_info["cores"],
-            "cpu_details": cpu_info,
-            "load": cpu_info["load"],
-            "memory": memory,
-            "storage": storage,
-            "disks": disks,
-            "uptime": get_uptime(),
-            "network": network,
-            "temperature": thermal["temperature"],
-            "thermal": thermal,
-            "battery": battery,
-            "services": services,
-            "timestamp": time.time(),
-            "collector_state": self.get_state()
-        }
-
+        """Thread-safe sampling entrypoint."""
         with self._lock:
-            self._cached_snapshot = snapshot
-            self._history["cpu"].append(cpu_info["usage"])
-            self._history["memory"].append(mem_pct)
-            self._history["steal"].append(cpu_info["steal"])
-            self._history["rx_rate"].append(network["rx_rate"])
-            self._history["tx_rate"].append(network["tx_rate"])
+            self._sample_locked()
 
     def get_snapshot(self):
         with self._lock:
-            if self._cached_snapshot is not None:
-                res = dict(self._cached_snapshot)
-                res["collector_state"] = self.get_state()
-                res["history"] = {
-                    "cpu": list(self._history["cpu"]),
-                    "memory": list(self._history["memory"]),
-                    "steal": list(self._history["steal"]),
-                    "rx_rate": list(self._history["rx_rate"]),
-                    "tx_rate": list(self._history["tx_rate"]),
-                }
-                return res
-
-        # Initial sample on demand
-        self._sample()
-        with self._lock:
+            if self._cached_snapshot is None:
+                self._sample_locked()
             res = dict(self._cached_snapshot)
             res["collector_state"] = self.get_state()
             res["history"] = {
@@ -2902,6 +3008,8 @@ class Handler(BaseHTTPRequestHandler):
         return limiter.allow_request(client_ip)
 
     def do_GET(self):
+        global _global_config
+
         # Rate Limiting
         if not self.check_rate_limit(_global_rate_limiter):
             self.send_data(json.dumps({"error": "Rate limit exceeded"}), "application/json", 429)
@@ -2939,6 +3047,10 @@ class Handler(BaseHTTPRequestHandler):
 
         # Speedtest Route
         if self.path == "/api/speedtest":
+            cfg = _global_config or Config()
+            if not cfg.speedtest_enabled:
+                self.send_data(json.dumps({"success": False, "error": "Speed test is disabled in server configuration"}), "application/json", 403)
+                return
             if not self.check_rate_limit(_speedtest_rate_limiter):
                 self.send_data(json.dumps({"success": False, "error": "Speedtest rate limit exceeded"}), "application/json", 429)
                 return
@@ -2954,7 +3066,6 @@ class Handler(BaseHTTPRequestHandler):
 
         # Configuration Info Route
         if self.path == "/api/config":
-            global _global_config
             cfg = _global_config or Config()
             safe_info = {
                 "auth_required": bool(cfg.auth_token),
@@ -3061,9 +3172,10 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 
-# Isolated Writable State Paths
+# Sandboxed Writable State & Configuration Isolation
 StateDirectory=servermonitor
-ReadWritePaths={working_dir}
+ConfigurationDirectory=servermonitor
+ReadOnlyPaths={working_dir}
 
 [Install]
 WantedBy=multi-user.target
@@ -3107,16 +3219,25 @@ def run_interactive_setup():
 
     # 2. Authentication
     print("\n[2/5] Access Security & Authentication")
-    print("  (Tip: A secret token protects your dashboard when accessible over LAN/WAN)")
-    gen_token = secrets.token_hex(16)
-    auth_choice = input(f"  Set access token? [y/N]: ").strip().lower()
-    if auth_choice in ("y", "yes"):
-        token_input = input(f"  Enter token or press enter to generate [{gen_token}]: ").strip()
+    is_loopback = config.host in ("127.0.0.1", "localhost", "::1")
+    if not is_loopback:
+        print("  [!] Notice: Non-loopback interface selected.")
+        print("  [!] An access token is MANDATORY when binding to LAN or external interfaces.")
+        gen_token = secrets.token_hex(16)
+        token_input = input(f"  Enter access token or press enter to generate [{gen_token}]: ").strip()
         config.auth_token = token_input or gen_token
         print(f"  -> Authentication Token set: {config.auth_token}")
     else:
-        config.auth_token = ""
-        print("  -> Running in tokenless mode (Recommended for localhost / SSH tunnel only).")
+        print("  (Tip: A secret token protects your dashboard when accessible over LAN/WAN)")
+        gen_token = secrets.token_hex(16)
+        auth_choice = input(f"  Set access token? [y/N]: ").strip().lower()
+        if auth_choice in ("y", "yes"):
+            token_input = input(f"  Enter token or press enter to generate [{gen_token}]: ").strip()
+            config.auth_token = token_input or gen_token
+            print(f"  -> Authentication Token set: {config.auth_token}")
+        else:
+            config.auth_token = ""
+            print("  -> Running in tokenless mode (Recommended for localhost / SSH tunnel only).")
 
     # 3. Intervals
     print("\n[3/5] Telemetry Cadence & Resource Conservation")
@@ -3298,6 +3419,18 @@ def main():
 
     HOST = _global_config.host
     PORT = _global_config.port
+
+    # Remote access security check: reject non-loopback binding without authentication
+    is_loopback = HOST in ("127.0.0.1", "localhost", "::1")
+    if not is_loopback and not _global_config.auth_token:
+        sys.stderr.write(
+            f"Security Error: ServerMonitor is configured to bind to non-loopback interface '{HOST}' "
+            f"without authentication enabled.\n"
+            f"Binding to external or LAN interfaces without an access token is rejected for security.\n"
+            f"Please specify an authentication token with --token <secret> or configure 'auth_token' in config.json.\n"
+            f"Alternatively, bind to 127.0.0.1 (default) and access via SSH tunnel or reverse proxy.\n"
+        )
+        sys.exit(1)
 
     # Start On-Demand Collector
     _global_collector = OnDemandCollector(

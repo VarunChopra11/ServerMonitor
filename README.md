@@ -1,7 +1,7 @@
 # ServerMonitor &bull; Universal Linux Server Monitoring
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python: 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
+[![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Architecture: ARM64 | x86_64 | Bare--Metal | VM | Container](https://img.shields.io/badge/arch-ARM64%20%7C%20x86__64%20%7C%20cgroups-success.svg)](https://github.com/VarunChopra11/ServerMonitor)
 [![Dependencies: Zero](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](https://github.com/VarunChopra11/ServerMonitor)
 
@@ -64,7 +64,7 @@ A production-ready, ultra-lightweight, universal Linux server monitoring applica
 
 - **Operating System**: Linux (Kernel 3.10+ / 4.x / 5.x / 6.x)
 - **Architecture**: ARM64, x86_64, ARMv7, RISC-V, or MIPS
-- **Python**: Python 3.6 or newer (`/usr/bin/python3`)
+- **Python**: Python 3.8 or newer (`/usr/bin/python3`)
 - **Dependencies**: **Zero** (Standard library only; no Flask, Node.js, Redis, or Docker daemon required)
 
 ---
@@ -291,14 +291,23 @@ sudo systemctl status servermonitor.service
 
 ---
 
-## Security Model & Guarantees
+## Security Architecture & Deployment Guarantees
+
+> [!IMPORTANT]
+> **Production Remote Access Requirement**: ServerMonitor must bind to loopback `127.0.0.1` (the default) and be accessed via SSH port forwarding, an encrypted mesh VPN (such as Tailscale or WireGuard), or behind a hardened TLS reverse proxy (Caddy or Nginx with HTTPS).
+> Binding to non-loopback addresses (`0.0.0.0` or public IPs) without an authentication token is **strictly rejected by default**. Direct public exposure over unencrypted HTTP without TLS is strongly discouraged.
 
 - **Strict Read-Only Monitoring**: The application performs **zero write operations** to monitored system files, services, firewall rules, or kernel knobs.
+- **Loopback Enforcement & Token Guard**: Rejects binding to external network interfaces without a cryptographically secure token.
 - **Constant-Time Verification**: Auth tokens are verified using `hmac.compare_digest` to prevent timing attacks.
+- **Strict Header Authentication**: Rejects token exposure in query parameters; requires `Authorization: Bearer <token>` or `X-Monitor-Token`.
+- **Systemd Process Isolation**: Generated systemd units enforce `ProtectSystem=strict`, `ProtectHome=read-only`, and `ReadOnlyPaths={working_dir}` with mutable state isolated to `StateDirectory=servermonitor` and configuration in `ConfigurationDirectory=servermonitor`.
+- **Installation & Uninstallation Safety**: Installer verifies systemd unit ownership before modifying service files; uninstaller verifies `pm_exec_path` and `ExecStart` matching this exact directory, preventing accidental deletion of foreign processes.
+- **Trusted Reverse-Proxy Validation**: Only trusts forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`) when the immediate peer belongs to explicitly configured `trusted_proxies`.
 - **Security Headers**: Injects `Content-Security-Policy: default-src 'self' 'unsafe-inline' data:`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
 - **DoS & Resource Exhaustion Defense**:
-  - Speed test is protected by a mutual exclusion lock (`_speedtest_lock`) and mandatory 60-second cooldown timer.
-  - Sliding-window in-memory IP rate limiter throttles rapid API abuse.
+  - Speed test is protected by a mutual exclusion lock (`_speedtest_lock`) and mandatory 60-second cooldown timer. It is fully disabled at the endpoint when `speedtest_enabled: false`.
+  - Sliding-window in-memory IP rate limiter throttles rapid API abuse and periodically purges expired records to prevent unbounded memory growth.
 - **Data Sanitization**: Sensitive environment variables and command line credentials are excluded from API payloads, and frontend outputs are sanitized via `escapeHtml()`.
 
 ---
