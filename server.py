@@ -2,7 +2,10 @@
 
 import json
 import os
+import shutil
 import socket
+import subprocess
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +18,13 @@ PORT = 8080
 _previous_cpu = None
 _previous_network = None
 _previous_sample_time = None
+
+# PM2 Cache state
+_pm2_cache_data = None
+_pm2_cache_time = 0.0
+_pm2_cache_lock = threading.Lock()
+PM2_CACHE_TTL = 5.0
+
 
 
 # ============================================================
@@ -355,6 +365,112 @@ def get_n8n_status():
 
 
 # ============================================================
+# PM2 SERVICES
+# ============================================================
+
+def get_pm2_services():
+    global _pm2_cache_data, _pm2_cache_time
+
+    now = time.monotonic()
+
+    if (
+        _pm2_cache_data is not None
+        and (now - _pm2_cache_time) < PM2_CACHE_TTL
+    ):
+        return _pm2_cache_data
+
+    with _pm2_cache_lock:
+
+        now = time.monotonic()
+
+        if (
+            _pm2_cache_data is not None
+            and (now - _pm2_cache_time) < PM2_CACHE_TTL
+        ):
+            return _pm2_cache_data
+
+        try:
+
+            proc = subprocess.run(
+                ["pm2", "jlist"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if proc.returncode != 0:
+                result = {
+                    "status": "error",
+                    "error": proc.stderr.strip() or f"PM2 exited with code {proc.returncode}",
+                    "services": []
+                }
+
+            else:
+                data = json.loads(proc.stdout)
+
+                if not isinstance(data, list):
+                    result = {
+                        "status": "error",
+                        "error": "Invalid PM2 output format",
+                        "services": []
+                    }
+
+                else:
+                    services = []
+
+                    for item in data:
+                        pm2_env = item.get("pm2_env") or {}
+                        monit = item.get("monit") or {}
+
+                        services.append({
+                            "name": item.get("name", "unknown"),
+                            "status": pm2_env.get("status", "unknown"),
+                            "pm_id": item.get("pm_id"),
+                            "cpu": monit.get("cpu", 0),
+                            "memory": monit.get("memory", 0),
+                        })
+
+                    result = {
+                        "status": "ok",
+                        "services": services
+                    }
+
+        except FileNotFoundError:
+            result = {
+                "status": "unavailable",
+                "error": "PM2 not found",
+                "services": []
+            }
+
+        except subprocess.TimeoutExpired:
+            result = {
+                "status": "error",
+                "error": "PM2 command timed out",
+                "services": []
+            }
+
+        except json.JSONDecodeError:
+            result = {
+                "status": "error",
+                "error": "Failed to parse PM2 output",
+                "services": []
+            }
+
+        except Exception as e:
+            result = {
+                "status": "error",
+                "error": str(e),
+                "services": []
+            }
+
+        _pm2_cache_data = result
+        _pm2_cache_time = time.monotonic()
+
+        return result
+
+
+
+# ============================================================
 # BATTERY
 # ============================================================
 
@@ -595,6 +711,99 @@ def run_speed_test():
 
 
 # ============================================================
+# ON-DEMAND LLM USAGE (ANTIGRAVITY CLI)
+# ============================================================
+
+_llm_lock = threading.Lock()
+
+def get_agy_executable():
+    path = shutil.which("agy")
+    if path:
+        return path
+    for candidate in [
+        "/home/server/.local/bin/agy",
+        os.path.expanduser("~/.local/bin/agy"),
+        "/usr/local/bin/agy",
+    ]:
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "agy"
+
+def run_llm_usage():
+    result = {
+        "success": False,
+        "groups": [],
+        "error": None
+    }
+
+    if not _llm_lock.acquire(blocking=False):
+        result["error"] = "LLM usage check already in progress"
+        return result
+
+    try:
+        agy_bin = get_agy_executable()
+        env = os.environ.copy()
+        user_home = os.path.expanduser("~server") if os.path.exists("/home/server") else os.path.expanduser("~")
+        local_bin = os.path.join(user_home, ".local", "bin")
+        if local_bin not in env.get("PATH", ""):
+            env["PATH"] = f"{local_bin}:{env.get('PATH', '')}"
+        if "HOME" not in env:
+            env["HOME"] = user_home
+
+        proc = subprocess.run(
+            [agy_bin, "-p", "/usage", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env
+        )
+
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or f"AGY process exited with code {proc.returncode}"
+            result["error"] = err_msg
+            return result
+
+        raw_data = json.loads(proc.stdout)
+        groups_data = raw_data.get("command", {}).get("data", {}).get("groups", [])
+        
+        parsed_groups = []
+        for g in groups_data:
+            group_name = g.get("name", "Unknown")
+            buckets = []
+            for b in g.get("buckets", []):
+                rem_frac = b.get("remaining_fraction", 0.0)
+                try:
+                    pct = round(float(rem_frac) * 100, 1)
+                except (ValueError, TypeError):
+                    pct = 0.0
+                buckets.append({
+                    "id": b.get("id", ""),
+                    "name": b.get("name", "Limit"),
+                    "window": b.get("window", ""),
+                    "percentage": pct,
+                    "reset_time": b.get("reset_time", ""),
+                })
+            parsed_groups.append({
+                "name": group_name,
+                "buckets": buckets
+            })
+
+        result["groups"] = parsed_groups
+        result["success"] = True
+
+    except subprocess.TimeoutExpired:
+        result["error"] = "AGY usage command timed out (30s limit)"
+    except json.JSONDecodeError:
+        result["error"] = "Failed to parse AGY usage output as JSON"
+    except Exception as e:
+        result["error"] = str(e)
+    finally:
+        _llm_lock.release()
+
+    return result
+
+
+# ============================================================
 # COMPLETE SERVER STATUS
 # ============================================================
 
@@ -640,18 +849,13 @@ def get_status():
 
         "services": {
 
-            "n8n":
-                get_n8n_status(),
-
-            "cloudflared":
-                get_process_status(
-                    "cloudflared"
-                ),
-
             "sshd":
                 get_process_status(
                     "sshd"
                 ),
+
+            "pm2":
+                get_pm2_services(),
         },
 
         "timestamp":
@@ -866,6 +1070,25 @@ body {
     display: grid;
 
     gap: 10px;
+
+    max-height: 140px;
+
+    overflow-y: auto;
+
+    scrollbar-width: none;
+
+    -ms-overflow-style: none;
+}
+
+.services::-webkit-scrollbar {
+    display: none;
+}
+
+.pm2-services {
+
+    display: grid;
+
+    gap: 10px;
 }
 
 .service {
@@ -874,6 +1097,33 @@ body {
 
     justify-content:
         space-between;
+
+    align-items: center;
+}
+
+.service-info {
+
+    display: flex;
+
+    flex-direction: column;
+
+    gap: 2px;
+}
+
+.service-sub {
+
+    font-size: 11px;
+
+    color: #8b949e;
+}
+
+.service-empty {
+
+    font-size: 13px;
+
+    color: #8b949e;
+
+    font-style: italic;
 }
 
 .online {
@@ -962,6 +1212,52 @@ body {
     font-size: 11px;
 
     line-height: 1.4;
+}
+
+.llm-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #21262d;
+}
+
+.llm-group:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+}
+
+.llm-group-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #58a6ff;
+    display: flex;
+    justify-content: space-between;
+}
+
+.llm-bucket {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.llm-bucket-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+.llm-bucket-name {
+    color: #8b949e;
+}
+
+.llm-bucket-val {
+    font-weight: 600;
+}
+
+.llm-bucket-reset {
+    font-size: 10px;
+    color: #6e7681;
 }
 
 .footer {
@@ -1380,32 +1676,6 @@ body {
                 <div class="service">
 
                     <span>
-                        n8n
-                    </span>
-
-                    <span id="n8n">
-                        --
-                    </span>
-
-                </div>
-
-
-                <div class="service">
-
-                    <span>
-                        Cloudflare
-                    </span>
-
-                    <span id="cloudflared">
-                        --
-                    </span>
-
-                </div>
-
-
-                <div class="service">
-
-                    <span>
                         SSH
                     </span>
 
@@ -1414,6 +1684,8 @@ body {
                     </span>
 
                 </div>
+
+                <div id="pm2Services" class="pm2-services"></div>
 
             </div>
 
@@ -1500,6 +1772,47 @@ body {
                 >
                     On-demand test. Uses temporary
                     internet bandwidth only when run.
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <!-- LLM USAGE -->
+
+        <div class="card">
+
+            <div class="card-title">
+                LLM Quota &amp; Usage
+            </div>
+
+            <div class="speed-test">
+
+                <button
+                    class="speed-button"
+                    id="llmusage-button"
+                    type="button"
+                    onclick="runLlmUsage()"
+                >
+                    Check LLM Quota
+                </button>
+
+                <div
+                    class="speed-results"
+                    id="llm-results"
+                >
+                    <div class="speed-result">
+                        <span class="speed-label">Gemini &amp; 3P Models</span>
+                        <span class="speed-value">--</span>
+                    </div>
+                </div>
+
+                <div
+                    class="speed-note"
+                    id="llmusage-note"
+                >
+                    On-demand quota check via AGY
                 </div>
 
             </div>
@@ -1595,6 +1908,17 @@ function formatUptime(seconds) {
 }
 
 
+function escapeHtml(text) {
+    if (text === null || text === undefined) return "";
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+
 function serviceStatus(
     element,
     online
@@ -1616,7 +1940,15 @@ function serviceStatus(
 // NORMAL DASHBOARD UPDATE
 // ============================================================
 
+let isUpdating = false;
+
 async function update() {
+
+    if (isUpdating || document.hidden) {
+        return;
+    }
+
+    isUpdating = true;
 
     try {
 
@@ -1842,30 +2174,57 @@ async function update() {
 
         serviceStatus(
             document.getElementById(
-                "n8n"
-            ),
-            data.services.n8n
-        );
-
-        serviceStatus(
-            document.getElementById(
-                "cloudflared"
-            ),
-            data.services.cloudflared
-        );
-
-        serviceStatus(
-            document.getElementById(
                 "sshd"
             ),
             data.services.sshd
         );
+
+        const pm2Container = document.getElementById("pm2Services");
+
+        if (pm2Container && data.services && data.services.pm2) {
+            const pm2 = data.services.pm2;
+
+            if (pm2.status === "unavailable") {
+                pm2Container.innerHTML = '<div class="service-empty">PM2 unavailable</div>';
+            } else if (pm2.status === "error") {
+                pm2Container.innerHTML = `<div class="service-empty">PM2 error: ${escapeHtml(pm2.error || "Command error")}</div>`;
+            } else if (!pm2.services || pm2.services.length === 0) {
+                pm2Container.innerHTML = '<div class="service-empty">No PM2 services</div>';
+            } else {
+                pm2Container.innerHTML = pm2.services.map(svc => {
+                    const isOnline = svc.status === "online";
+                    const statusClass = isOnline ? "online" : "offline";
+                    const statusText = (svc.status || "UNKNOWN").toUpperCase();
+
+                    const memText = svc.memory ? (svc.memory / (1024 * 1024)).toFixed(0) + " MB" : "";
+                    const cpuText = (svc.cpu !== undefined && svc.cpu !== null) ? svc.cpu + "%" : "";
+                    const details = [memText, cpuText].filter(Boolean).join(" · ");
+                    const subText = details ? `<span class="service-sub">${escapeHtml(details)}</span>` : "";
+
+                    return `
+                        <div class="service">
+                            <div class="service-info">
+                                <span>${escapeHtml(svc.name)}</span>
+                                ${subText}
+                            </div>
+                            <span class="${statusClass}">${statusText}</span>
+                        </div>
+                    `;
+                }).join("");
+            }
+        }
 
     }
 
     catch (error) {
 
         console.error(error);
+
+    }
+
+    finally {
+
+        isUpdating = false;
 
     }
 
@@ -2003,6 +2362,75 @@ async function runSpeedTest() {
 }
 
 
+async function runLlmUsage() {
+
+    const button =
+        document.getElementById("llmusage-button");
+    const resultsContainer =
+        document.getElementById("llm-results");
+    const note =
+        document.getElementById("llmusage-note");
+
+    button.disabled = true;
+    button.textContent = "Checking Quotas...";
+    note.textContent = "Querying Antigravity CLI usage quotas (takes ~15-20s)...";
+
+    try {
+        const response = await fetch("/api/llmusage");
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.error || "Failed to fetch LLM usage");
+        }
+
+        if (!data.groups || data.groups.length === 0) {
+            resultsContainer.innerHTML = `
+                <div class="speed-result">
+                    <span class="speed-label">No active quota groups found</span>
+                </div>
+            `;
+        } else {
+            resultsContainer.innerHTML = data.groups.map(group => {
+                const bucketsHtml = (group.buckets || []).map(b => {
+                    const resetTimeStr = b.reset_time ? new Date(b.reset_time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', month: 'short', day: 'numeric'}) : '';
+                    const colorClass = b.percentage < 20 ? 'offline' : (b.percentage < 50 ? 'warning' : 'online');
+                    return `
+                        <div class="llm-bucket">
+                            <div class="llm-bucket-header">
+                                <span class="llm-bucket-name">${b.name}</span>
+                                <span class="llm-bucket-val ${colorClass}">${b.percentage}%</span>
+                            </div>
+                            ${resetTimeStr ? `<span class="llm-bucket-reset">Resets: ${resetTimeStr}</span>` : ''}
+                        </div>
+                    `;
+                }).join('');
+
+                return `
+                    <div class="llm-group">
+                        <div class="llm-group-title">${group.name}</div>
+                        ${bucketsHtml}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        note.textContent = "Quota refreshed successfully.";
+    }
+    catch (error) {
+        resultsContainer.innerHTML = `
+            <div class="speed-result">
+                <span class="speed-label offline">Error: ${error.message}</span>
+            </div>
+        `;
+        note.textContent = "Could not fetch LLM usage quota.";
+    }
+    finally {
+        button.disabled = false;
+        button.textContent = "Check LLM Quota";
+    }
+}
+
+
 // ============================================================
 // START DASHBOARD
 // ============================================================
@@ -2011,7 +2439,16 @@ update();
 
 setInterval(
     update,
-    1000
+    2000
+);
+
+document.addEventListener(
+    "visibilitychange",
+    () => {
+        if (!document.hidden) {
+            update();
+        }
+    }
 );
 
 </script>
@@ -2103,6 +2540,20 @@ class Handler(
         if self.path == "/api/speedtest":
 
             result = run_speed_test()
+
+            self.send_data(
+                json.dumps(result),
+                "application/json"
+            )
+
+            return
+
+
+        # On-demand LLM usage
+
+        if self.path == "/api/llmusage":
+
+            result = run_llm_usage()
 
             self.send_data(
                 json.dumps(result),
