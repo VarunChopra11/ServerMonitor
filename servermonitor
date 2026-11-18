@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# ServerMonitor CLI Wrapper
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${PYTHON:-python3}"
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Error: Python 3 is required but was not found in PATH." >&2
+    exit 1
+fi
+
+case "$1" in
+    setup)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --setup "$@"
+        ;;
+    status)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --status "$@"
+        ;;
+    tunnel)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --tunnel "$@"
+        ;;
+    benchmark)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --benchmark "$@"
+        ;;
+    systemd)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --generate-systemd "$@"
+        ;;
+    pm2)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --generate-pm2 "$@"
+        ;;
+    uninstall)
+        if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+            exec bash "$SCRIPT_DIR/uninstall.sh" "$@"
+        else
+            echo "Error: uninstall.sh not found." >&2
+            exit 1
+        fi
+        ;;
+    start|run)
+        shift
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" "$@"
+        ;;
+    help|--help|-h)
+        cat <<EOF
+ServerMonitor CLI - Universal Linux System Telemetry (v2.0)
+
+Usage:
+  ./servermonitor <command> [options]
+  python3 server.py [options]
+
+Commands:
+  setup             Launch interactive CLI configuration wizard
+  start | run       Start the ServerMonitor web service
+  status            Inspect running service health and port status
+  tunnel            Print SSH port forwarding command for remote access
+  benchmark         Measure memory (RSS) and sampling query performance
+  systemd           Generate hardened systemd unit file
+  pm2               Generate PM2 ecosystem configuration
+  uninstall         Safely remove configuration and registered services
+
+Options:
+  --port <PORT>     Port to listen on (default: 8080)
+  --host <HOST>     Host address to bind (default: 127.0.0.1)
+  --token <SECRET>  Require authentication token
+  --config <PATH>   Path to custom config.json
+EOF
+        ;;
+    *)
+        exec "$PYTHON_BIN" "$SCRIPT_DIR/server.py" "$@"
+        ;;
+esac

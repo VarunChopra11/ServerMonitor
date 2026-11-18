@@ -1,0 +1,39 @@
+{
+  "_comment": "ServerMonitor v2.0 Configuration Template",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "auth_token": "",
+  "sample_interval": 2.0,
+  "inactivity_timeout": 15.0,
+  "history_points": 60,
+  "speedtest_enabled": true,
+  "speedtest_cooldown": 60.0,
+  "modules": {
+    "cpu": true,
+    "memory": true,
+    "storage": true,
+    "network": true,
+    "thermals": true,
+    "battery": true,
+    "services": true,
+    "pm2": true,
+    "systemd": true,
+    "docker": false,
+    "antigravity": true
+  },
+  "monitored_systemd_units": [
+    "ssh",
+    "sshd",
+    "nginx",
+    "caddy",
+    "docker"
+  ],
+  "monitored_processes": [
+    "sshd"
+  ],
+  "monitored_http_urls": [],
+  "trusted_proxies": [
+    "127.0.0.1",
+    "::1"
+  ]
+}
