@@ -27,7 +27,8 @@ fi
 UNIT_FILE="/etc/systemd/system/servermonitor.service"
 if [ -f "$UNIT_FILE" ]; then
     EXISTING_EXEC=$(grep -E "^ExecStart=" "$UNIT_FILE" | head -n1 || true)
-    if echo "$EXISTING_EXEC" | grep -q "$SCRIPT_DIR"; then
+    # Strictly match script server.py or servermonitor within this installation directory boundary
+    if echo "$EXISTING_EXEC" | grep -E -q "(^|[[:space:]=\"'])$SCRIPT_DIR/(server\.py|servermonitor)([[:space:]\"']|$)"; then
         echo "Found systemd service matching this installation ($SCRIPT_DIR). Stopping and removing..."
         if command -v systemctl >/dev/null 2>&1; then
             systemctl stop servermonitor.service || true
@@ -47,19 +48,34 @@ fi
 # Stop PM2 process ONLY if its executable path matches this installation
 if command -v pm2 >/dev/null 2>&1; then
     MATCHING_PM2_IDS=$(python3 -c "
-import json, subprocess, sys
+import json, os, subprocess, sys
 try:
     p = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True, check=True)
     proc_list = json.loads(p.stdout)
-    target_dir = sys.argv[1]
+    target_dir = os.path.abspath(sys.argv[1])
     matches = []
     for proc in proc_list:
         pm_env = proc.get('pm2_env', {})
-        exec_path = pm_env.get('pm_exec_path', '')
-        cwd = pm_env.get('pm_cwd', '')
+        exec_path = os.path.abspath(pm_env.get('pm_exec_path', '')) if pm_env.get('pm_exec_path') else ''
+        cwd = os.path.abspath(pm_env.get('pm_cwd', '')) if pm_env.get('pm_cwd') else ''
         pm_id = proc.get('pm_id')
         name = proc.get('name', '')
-        if (target_dir in exec_path or target_dir in cwd):
+
+        is_in_target = False
+        if exec_path:
+            try:
+                if os.path.commonpath([target_dir, exec_path]) == target_dir and os.path.basename(exec_path) == 'server.py':
+                    is_in_target = True
+            except ValueError:
+                pass
+        if cwd and not is_in_target:
+            try:
+                if os.path.commonpath([target_dir, cwd]) == target_dir and name.startswith('servermonitor'):
+                    is_in_target = True
+            except ValueError:
+                pass
+
+        if is_in_target:
             matches.append((str(pm_id), name, exec_path))
     for mid, name, ep in matches:
         print(f'{mid}:{name}:{ep}')

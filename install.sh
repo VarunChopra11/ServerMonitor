@@ -28,6 +28,17 @@ if [ "$PY_OK" != "1" ]; then
 fi
 echo -e "Detected Python: ${GREEN}Python ${PY_VERSION}${NC} (compatible)"
 
+# Helper: Create timestamped backup of an existing file
+backup_file() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        local timestamp
+        timestamp=$(date +%Y%m%d%H%M%S)
+        cp -p "$file" "${file}.bak.${timestamp}"
+        echo -e "${YELLOW}[!] Created backup of existing file: ${file}.bak.${timestamp}${NC}"
+    fi
+}
+
 # Determine installation directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_TARGET_DIR="/opt/servermonitor"
@@ -42,12 +53,14 @@ echo -e "Installation Directory: ${GREEN}${TARGET_DIR}${NC}"
 # Copy files if installing to an external target directory
 if [ "$SCRIPT_DIR" != "$TARGET_DIR" ]; then
     mkdir -p "$TARGET_DIR"
-    cp "$SCRIPT_DIR/server.py" "$TARGET_DIR/"
-    cp "$SCRIPT_DIR/servermonitor" "$TARGET_DIR/"
-    cp "$SCRIPT_DIR/config.example.json" "$TARGET_DIR/"
-    if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
-        cp "$SCRIPT_DIR/uninstall.sh" "$TARGET_DIR/"
-    fi
+    for file_name in "server.py" "servermonitor" "config.example.json" "uninstall.sh"; do
+        if [ -f "$TARGET_DIR/$file_name" ]; then
+            backup_file "$TARGET_DIR/$file_name"
+        fi
+        if [ -f "$SCRIPT_DIR/$file_name" ]; then
+            cp "$SCRIPT_DIR/$file_name" "$TARGET_DIR/"
+        fi
+    done
     chmod +x "$TARGET_DIR/server.py" "$TARGET_DIR/servermonitor"
 fi
 
@@ -84,7 +97,11 @@ if [ "$EUID" -eq 0 ] && [ -d "/run/systemd/system" ]; then
         read -p "Install as systemd service (/etc/systemd/system/servermonitor.service)? [Y/n] " install_systemd
         install_systemd=${install_systemd:-Y}
         if [[ "$install_systemd" =~ ^[Yy]$ ]]; then
-            python3 "$TARGET_DIR/server.py" --generate-systemd > "$UNIT_FILE"
+            if [ -f "$UNIT_FILE" ]; then
+                backup_file "$UNIT_FILE"
+            fi
+            SERVICE_USER="${SUDO_USER:-nobody}"
+            python3 "$TARGET_DIR/server.py" --generate-systemd --user "$SERVICE_USER" > "$UNIT_FILE"
             systemctl daemon-reload
             systemctl enable --now servermonitor.service
             echo -e "${GREEN}[✓] ServerMonitor systemd service enabled and started.${NC}"

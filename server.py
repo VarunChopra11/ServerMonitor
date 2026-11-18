@@ -124,8 +124,8 @@ class Config:
             "/var/lib/servermonitor/config.json",
             "/etc/servermonitor/config.json",
             os.path.expanduser("~/.config/servermonitor/config.json"),
-            os.path.join(os.getcwd(), "config.json"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+            os.path.join(os.getcwd(), "config.json"),
         ]
         for c in candidates:
             if os.path.exists(c):
@@ -140,7 +140,7 @@ class Config:
             return "/var/lib/servermonitor/config.json"
         if os.path.exists("/etc/servermonitor") and os.access("/etc/servermonitor", os.W_OK):
             return "/etc/servermonitor/config.json"
-        return os.path.join(os.getcwd(), "config.json")
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
     def load(self):
         try:
@@ -153,15 +153,19 @@ class Config:
                             self.data[k].update(copy.deepcopy(v))
                         else:
                             self.data[k] = copy.deepcopy(v)
-        except Exception as e:
-            sys.stderr.write(f"Warning: Failed to load config from {self.config_file}: {e}\n")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise RuntimeError(f"Fatal: Corrupt or unparseable configuration file '{self.config_file}': {e}") from e
+        except OSError as e:
+            raise RuntimeError(f"Fatal: Failed to read configuration file '{self.config_file}': {e}") from e
 
     def save(self):
         try:
             dirname = os.path.dirname(os.path.abspath(self.config_file))
             if dirname and not os.path.exists(dirname):
                 os.makedirs(dirname, mode=0o700, exist_ok=True)
-            with open(self.config_file, "w") as f:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(self.config_file, flags, 0o600)
+            with open(fd, "w") as f:
                 json.dump(self.data, f, indent=2)
             os.chmod(self.config_file, 0o600)
             return True
@@ -1348,11 +1352,13 @@ def run_speed_test():
 
     try:
         now = time.monotonic()
-        elapsed_since_last = now - _speedtest_last_run
-        if elapsed_since_last < _speedtest_cooldown:
-            remaining = int(_speedtest_cooldown - elapsed_since_last)
-            result["error"] = f"Cooldown active. Please wait {remaining} seconds before testing again."
-            return result
+        cooldown = cfg.speedtest_cooldown
+        if _speedtest_last_run > 0.0:
+            elapsed_since_last = now - _speedtest_last_run
+            if elapsed_since_last < cooldown:
+                remaining = int(cooldown - elapsed_since_last)
+                result["error"] = f"Cooldown active. Please wait {remaining} seconds before testing again."
+                return result
 
         # 1. Latency Check
         latency_start = time.monotonic()
@@ -2947,6 +2953,13 @@ document.addEventListener(
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 10.0
+
+    def handle(self):
+        try:
+            super().handle()
+        except (socket.timeout, TimeoutError):
+            self.close_connection = True
 
     def log_message(self, format, *args):
         # Disable verbose access logging
@@ -2972,6 +2985,46 @@ class Handler(BaseHTTPRequestHandler):
             return True
         provided_token = extract_token(self.headers, self.path)
         return verify_token(expected_token, provided_token)
+
+    def is_allowed_host(self):
+        global _global_config, HOST
+        host_header = self.headers.get("Host")
+        if not host_header:
+            return False
+
+        # Extract hostname/IP without port
+        host_val = host_header.strip()
+        if host_val.startswith("["):
+            # IPv6 literal [::1]:8080 or [::1]
+            end_bracket = host_val.find("]")
+            if end_bracket != -1:
+                hostname = host_val[1:end_bracket]
+            else:
+                hostname = host_val
+        else:
+            hostname = host_val.split(":")[0]
+
+        if not hostname:
+            return False
+
+        allowed = {"127.0.0.1", "localhost", "::1"}
+        cfg_host = _global_config.host if _global_config else HOST
+        if cfg_host and cfg_host not in ("0.0.0.0", "::"):
+            allowed.add(cfg_host)
+
+        if _global_config and hasattr(_global_config, "data"):
+            proxies = _global_config.data.get("trusted_proxies", [])
+            for p in proxies:
+                allowed.add(p)
+            custom_allowed = _global_config.data.get("allowed_hosts", [])
+            for h in custom_allowed:
+                allowed.add(h)
+
+        local_ip = get_local_ip()
+        if local_ip:
+            allowed.add(local_ip)
+
+        return hostname.lower() in {h.lower() for h in allowed}
 
     def get_client_ip(self):
         global _global_config
@@ -3009,6 +3062,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global _global_config
+
+        # DNS Rebinding Defense: Host Header Verification
+        if not self.is_allowed_host():
+            self.send_data(json.dumps({"error": "Invalid or missing Host header"}), "application/json", 400)
+            return
 
         # Rate Limiting
         if not self.check_rate_limit(_global_rate_limiter):
@@ -3083,29 +3141,61 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
+        # 1. DNS Rebinding Defense: Host Header Verification
+        if not self.is_allowed_host():
+            self.send_data(json.dumps({"error": "Invalid or missing Host header"}), "application/json", 400)
+            return
+
+        # 2. Rate Limiting
+        if not self.check_rate_limit(_global_rate_limiter):
+            self.send_data(json.dumps({"error": "Rate limit exceeded"}), "application/json", 429)
+            return
+
+        # 3. Route Validation
+        is_heartbeat = (self.path == "/api/heartbeat" or self.path.startswith("/api/heartbeat?"))
+        if not is_heartbeat:
+            self.send_response(404)
+            self.send_security_headers()
+            self.end_headers()
+            return
+
+        # 4. Authentication Check BEFORE Reading Request Body
+        if not self.is_authenticated():
+            self.send_data(json.dumps({"error": "Unauthorized"}), "application/json", 401)
+            return
+
+        # 5. Content-Length Validation & Body Size Limiting (DoS Defense)
+        cl_header = self.headers.get("Content-Length")
+        content_length = 0
+        if cl_header is not None:
+            try:
+                content_length = int(cl_header.strip())
+                if content_length < 0:
+                    self.send_data(json.dumps({"error": "Invalid Content-Length"}), "application/json", 400)
+                    return
+            except (ValueError, TypeError):
+                self.send_data(json.dumps({"error": "Invalid Content-Length"}), "application/json", 400)
+                return
+
+        MAX_CONTENT_LENGTH = 65536  # 64 KB limit
+        if content_length > MAX_CONTENT_LENGTH:
+            self.send_data(json.dumps({"error": "Payload Too Large: Content-Length exceeds limit"}), "application/json", 413)
+            return
+
+        # 6. Read Body Safely
         if content_length > 0:
             self.rfile.read(content_length)
 
-        # Heartbeat endpoint
-        if self.path == "/api/heartbeat" or self.path.startswith("/api/heartbeat?"):
-            if not self.is_authenticated():
-                self.send_data(json.dumps({"error": "Unauthorized"}), "application/json", 401)
-                return
-            session_id = "default"
-            if "?" in self.path:
-                for param in self.path.split("?", 1)[1].split("&"):
-                    if param.startswith("session="):
-                        session_id = param.split("=", 1)[1].strip()
-                        break
-            if _global_collector:
-                _global_collector.touch_session(session_id)
-            self.send_data(json.dumps({"status": "ok", "state": _global_collector.get_state() if _global_collector else "standalone"}), "application/json")
-            return
-
-        self.send_response(404)
-        self.send_security_headers()
-        self.end_headers()
+        # 7. Process Heartbeat Endpoint
+        session_id = "default"
+        if "?" in self.path:
+            for param in self.path.split("?", 1)[1].split("&"):
+                if param.startswith("session="):
+                    session_id = param.split("=", 1)[1].strip()
+                    break
+        if _global_collector:
+            _global_collector.touch_session(session_id)
+        self.send_data(json.dumps({"status": "ok", "state": _global_collector.get_state() if _global_collector else "standalone"}), "application/json")
 
 
 # ============================================================
@@ -3146,7 +3236,18 @@ def generate_pm2_config(app_name="servermonitor", script_path=None, port=8080, h
 def generate_systemd_service(user=None, exec_start=None, working_dir=None):
     """Generates a hardened, read-only systemd service definition."""
     if not user:
-        user = os.environ.get("USER", "root")
+        sudo_user = os.environ.get("SUDO_USER")
+        current_user = os.environ.get("USER")
+        is_root = False
+        if hasattr(os, "geteuid"):
+            is_root = (os.geteuid() == 0)
+        elif current_user == "root":
+            is_root = True
+
+        if is_root:
+            user = sudo_user or "nobody"
+        else:
+            user = current_user or "nobody"
     if not exec_start:
         exec_start = f"{sys.executable} {os.path.abspath(__file__)}"
     if not working_dir:
@@ -3198,14 +3299,14 @@ def get_local_ip():
 # MODERN INTERACTIVE CLI SETUP WIZARD
 # ============================================================
 
-def run_interactive_setup():
+def run_interactive_setup(config_file=None):
     """Interactive CLI setup wizard with validation and deployment configuration."""
     print("\n" + "=" * 64)
     print("  ServerMonitor v2.0 - Universal Production Setup Wizard")
     print("=" * 64 + "\n")
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    config = Config()
+    config = Config(config_file=config_file)
 
     # 1. Host and Port
     print("[1/5] Network Binding & Port")
@@ -3342,6 +3443,7 @@ def main():
     parser.add_argument("--benchmark", action="store_true", help="Run memory/CPU resource benchmark")
     parser.add_argument("--tunnel", action="store_true", help="Print SSH tunnel command")
     parser.add_argument("--generate-systemd", action="store_true", help="Output hardened systemd unit file")
+    parser.add_argument("--user", help="User to run systemd service as (default: non-root user or nobody)")
     parser.add_argument("--generate-pm2", action="store_true", help="Output PM2 ecosystem configuration")
     parser.add_argument("--status", action="store_true", help="Check running status of ServerMonitor")
 
@@ -3349,7 +3451,7 @@ def main():
 
     # CLI subcommands
     if args.setup:
-        run_interactive_setup()
+        run_interactive_setup(config_file=args.config)
         return
 
     if args.benchmark:
@@ -3364,7 +3466,7 @@ def main():
         return
 
     if args.generate_systemd:
-        print(generate_systemd_service())
+        print(generate_systemd_service(user=args.user))
         return
 
     if args.generate_pm2:
