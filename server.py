@@ -2615,7 +2615,9 @@ function getStoredToken() {
 function saveAuthToken() {
     const input = document.getElementById("tokenInput");
     if (input && input.value.trim()) {
-        sessionStorage.setItem("sm_token", input.value.trim());
+        const val = input.value.trim();
+        localStorage.setItem("sm_token", val);
+        sessionStorage.setItem("sm_token", val);
         document.getElementById("authModal").style.display = "none";
         update();
     }
@@ -2666,6 +2668,8 @@ async function update() {
         });
 
         if (res.status === 401) {
+            localStorage.removeItem("sm_token");
+            sessionStorage.removeItem("sm_token");
             document.getElementById("authModal").style.display = "flex";
             const pill = document.getElementById("connectionPill");
             pill.className = "status-pill offline";

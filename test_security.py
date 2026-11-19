@@ -129,5 +129,11 @@ class TestSecurityAndAuth(unittest.TestCase):
         self.assertTrue(limiter.allow_request("10.0.0.1"))
 
 
+    def test_auth_token_localstorage_persistence(self):
+        """Verifies that the frontend template persists authentication tokens to localStorage."""
+        self.assertIn('localStorage.setItem("sm_token", val)', server.HTML)
+        self.assertIn('localStorage.removeItem("sm_token")', server.HTML)
+        self.assertIn('getStoredToken()', server.HTML)
+
 if __name__ == "__main__":
     unittest.main()
