@@ -90,12 +90,43 @@ except Exception:
             pm2 delete "$mid" || true
             echo "[✓] PM2 process [ID $mid: '$mname'] removed."
         done
+        pm2 save || true
     else
         echo "[✓] No running PM2 processes match this installation ($SCRIPT_DIR). Existing PM2 processes left untouched."
     fi
 fi
 
-read -p "Remove configuration (config.json)? [y/N] " rm_config
+# Clean up /etc/servermonitor if it belongs to this installation
+if [ -d "/etc/servermonitor" ]; then
+    INSTALLED_BY=""
+    if [ -f "/etc/servermonitor/.installed_by" ]; then
+        INSTALLED_BY=$(cat "/etc/servermonitor/.installed_by" 2>/dev/null || true)
+    fi
+    if [ "$INSTALLED_BY" = "$SCRIPT_DIR" ] || [ -z "$INSTALLED_BY" ]; then
+        read -p "Remove service configuration (/etc/servermonitor)? [y/N] " rm_etc
+        if [[ "$rm_etc" =~ ^[Yy]$ ]]; then
+            rm -rf "/etc/servermonitor"
+            echo "[✓] /etc/servermonitor removed."
+        fi
+    fi
+fi
+
+# Clean up /var/lib/servermonitor if it belongs to this installation
+if [ -d "/var/lib/servermonitor" ]; then
+    INSTALLED_BY=""
+    if [ -f "/var/lib/servermonitor/.installed_by" ]; then
+        INSTALLED_BY=$(cat "/var/lib/servermonitor/.installed_by" 2>/dev/null || true)
+    fi
+    if [ "$INSTALLED_BY" = "$SCRIPT_DIR" ] || [ -z "$INSTALLED_BY" ]; then
+        read -p "Remove service state directory (/var/lib/servermonitor)? [y/N] " rm_var
+        if [[ "$rm_var" =~ ^[Yy]$ ]]; then
+            rm -rf "/var/lib/servermonitor"
+            echo "[✓] /var/lib/servermonitor removed."
+        fi
+    fi
+fi
+
+read -p "Remove local configuration ($SCRIPT_DIR/config.json)? [y/N] " rm_config
 if [[ "$rm_config" =~ ^[Yy]$ ]]; then
     rm -f "$SCRIPT_DIR/config.json"
     echo "[✓] config.json removed."

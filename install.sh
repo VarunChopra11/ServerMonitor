@@ -41,14 +41,24 @@ backup_file() {
 
 # Determine installation directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_TARGET_DIR="/opt/servermonitor"
-if [ "$EUID" -ne 0 ]; then
-    DEFAULT_TARGET_DIR="$HOME/.local/share/servermonitor"
-fi
-
 TARGET_DIR="${SERVERMONITOR_DIR:-$SCRIPT_DIR}"
 
 echo -e "Installation Directory: ${GREEN}${TARGET_DIR}${NC}"
+
+# Determine service user for non-root execution
+SERVICE_USER="${SUDO_USER:-$USER}"
+if [ "$SERVICE_USER" = "root" ] && [ "$EUID" -eq 0 ]; then
+    SERVICE_USER="nobody"
+fi
+
+# Prepare system directories if running as root
+if [ "$EUID" -eq 0 ]; then
+    mkdir -p /etc/servermonitor /var/lib/servermonitor
+    chown -R "$SERVICE_USER":"$SERVICE_USER" /etc/servermonitor /var/lib/servermonitor 2>/dev/null || chown -R "$SERVICE_USER" /etc/servermonitor /var/lib/servermonitor
+    chmod 750 /etc/servermonitor /var/lib/servermonitor
+    echo "$TARGET_DIR" > /etc/servermonitor/.installed_by
+    echo "$TARGET_DIR" > /var/lib/servermonitor/.installed_by
+fi
 
 # Copy files if installing to an external target directory
 if [ "$SCRIPT_DIR" != "$TARGET_DIR" ]; then
@@ -64,12 +74,35 @@ if [ "$SCRIPT_DIR" != "$TARGET_DIR" ]; then
     chmod +x "$TARGET_DIR/server.py" "$TARGET_DIR/servermonitor"
 fi
 
-# Run interactive setup wizard if config.json does not exist
-if [ ! -f "$TARGET_DIR/config.json" ]; then
+# Determine target config path
+CONFIG_DEST=""
+if [ "$EUID" -eq 0 ]; then
+    CONFIG_DEST="/etc/servermonitor/config.json"
+fi
+
+# Run interactive setup wizard if configuration does not exist
+if [ -n "$CONFIG_DEST" ] && [ ! -f "$CONFIG_DEST" ] && [ ! -f "$TARGET_DIR/config.json" ]; then
+    echo -e "\n${YELLOW}No configuration found. Launching interactive setup...${NC}"
+    python3 "$TARGET_DIR/server.py" --setup --config "$CONFIG_DEST"
+    if [ -f "$CONFIG_DEST" ]; then
+        chown "$SERVICE_USER":"$SERVICE_USER" "$CONFIG_DEST" 2>/dev/null || chown "$SERVICE_USER" "$CONFIG_DEST"
+        chmod 600 "$CONFIG_DEST"
+    fi
+elif [ -z "$CONFIG_DEST" ] && [ ! -f "$TARGET_DIR/config.json" ]; then
     echo -e "\n${YELLOW}No config.json found. Launching interactive setup...${NC}"
     python3 "$TARGET_DIR/server.py" --setup
 else
-    echo -e "${GREEN}[✓] Existing config.json found in ${TARGET_DIR}.${NC}"
+    echo -e "${GREEN}[✓] Existing configuration found.${NC}"
+    # Ensure existing configuration is readable by SERVICE_USER if run as root
+    if [ "$EUID" -eq 0 ]; then
+        if [ -f "$CONFIG_DEST" ]; then
+            chown "$SERVICE_USER":"$SERVICE_USER" "$CONFIG_DEST" 2>/dev/null || chown "$SERVICE_USER" "$CONFIG_DEST"
+            chmod 600 "$CONFIG_DEST"
+        fi
+        if [ -f "$TARGET_DIR/config.json" ]; then
+            chown "$SERVICE_USER":"$SERVICE_USER" "$TARGET_DIR/config.json" 2>/dev/null || chown "$SERVICE_USER" "$TARGET_DIR/config.json"
+        fi
+    fi
 fi
 
 # Offer systemd installation if root and systemd active
@@ -81,8 +114,11 @@ if [ "$EUID" -eq 0 ] && [ -d "/run/systemd/system" ]; then
         echo -e "\n${YELLOW}[!] An existing systemd service was detected at ${UNIT_FILE}.${NC}"
         EXISTING_EXEC=$(grep -E "^ExecStart=" "$UNIT_FILE" | head -n1 | cut -d= -f2- || true)
         echo -e "    Existing ExecStart: ${EXISTING_EXEC}"
-        if ! echo "$EXISTING_EXEC" | grep -q "$TARGET_DIR"; then
-            echo -e "${RED}[WARNING] The existing unit does NOT point to this installation ($TARGET_DIR).${NC}"
+        EXISTING_SCRIPT=$(echo "$EXISTING_EXEC" | awk '{for(i=1;i<=NF;i++) if($i ~ /server\.py$/) print $i}')
+        TARGET_SCRIPT="$TARGET_DIR/server.py"
+
+        if [ "$EXISTING_SCRIPT" != "$TARGET_SCRIPT" ]; then
+            echo -e "${RED}[WARNING] The existing unit does NOT point to this installation ('$EXISTING_SCRIPT' != '$TARGET_SCRIPT').${NC}"
             echo -e "Overwriting it may break an existing service or another installation."
             read -p "Overwrite existing service anyway? [y/N]: " overwrite_unit
             overwrite_unit=${overwrite_unit:-N}
@@ -100,7 +136,6 @@ if [ "$EUID" -eq 0 ] && [ -d "/run/systemd/system" ]; then
             if [ -f "$UNIT_FILE" ]; then
                 backup_file "$UNIT_FILE"
             fi
-            SERVICE_USER="${SUDO_USER:-nobody}"
             python3 "$TARGET_DIR/server.py" --generate-systemd --user "$SERVICE_USER" > "$UNIT_FILE"
             systemctl daemon-reload
             systemctl enable --now servermonitor.service

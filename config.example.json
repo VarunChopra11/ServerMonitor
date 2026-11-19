@@ -19,7 +19,7 @@
     "pm2": true,
     "systemd": true,
     "docker": false,
-    "antigravity": true
+    "antigravity": false
   },
   "monitored_systemd_units": [
     "ssh",
@@ -35,5 +35,12 @@
   "trusted_proxies": [
     "127.0.0.1",
     "::1"
+  ],
+  "allowed_hosts": [
+    "127.0.0.1",
+    "localhost",
+    "::1",
+    "monitor.yourdomain.com",
+    "*.ts.net"
   ]
 }

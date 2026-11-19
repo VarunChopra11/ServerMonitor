@@ -67,6 +67,9 @@ _global_config = None
 
 
 # ============================================================
+MIN_TOKEN_LENGTH = 24
+
+# ============================================================
 # CONFIGURATION MANAGEMENT
 # ============================================================
 
@@ -93,12 +96,13 @@ class Config:
             "pm2": True,
             "systemd": True,
             "docker": False,
-            "antigravity": True,
+            "antigravity": False,
         },
         "monitored_systemd_units": ["ssh", "sshd", "nginx", "caddy", "docker"],
         "monitored_processes": ["sshd"],
         "monitored_http_urls": [],
-        "trusted_proxies": ["127.0.0.1", "::1"]
+        "trusted_proxies": ["127.0.0.1", "::1"],
+        "allowed_hosts": ["127.0.0.1", "localhost", "::1"]
     }
 
     def __init__(self, config_file=None):
@@ -113,7 +117,7 @@ class Config:
             return env_cfg
 
         # Support systemd-provided state and configuration directories
-        for env_var in ("STATE_DIRECTORY", "CONFIGURATION_DIRECTORY"):
+        for env_var in ("CONFIGURATION_DIRECTORY", "STATE_DIRECTORY"):
             d = os.environ.get(env_var)
             if d:
                 cfg_path = os.path.join(d, "config.json")
@@ -121,25 +125,24 @@ class Config:
                     return cfg_path
 
         candidates = [
-            "/var/lib/servermonitor/config.json",
             "/etc/servermonitor/config.json",
+            "/var/lib/servermonitor/config.json",
             os.path.expanduser("~/.config/servermonitor/config.json"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
-            os.path.join(os.getcwd(), "config.json"),
         ]
         for c in candidates:
             if os.path.exists(c):
                 return c
 
-        if os.environ.get("STATE_DIRECTORY"):
-            return os.path.join(os.environ["STATE_DIRECTORY"], "config.json")
         if os.environ.get("CONFIGURATION_DIRECTORY"):
             return os.path.join(os.environ["CONFIGURATION_DIRECTORY"], "config.json")
+        if os.environ.get("STATE_DIRECTORY"):
+            return os.path.join(os.environ["STATE_DIRECTORY"], "config.json")
 
-        if os.path.exists("/var/lib/servermonitor") and os.access("/var/lib/servermonitor", os.W_OK):
-            return "/var/lib/servermonitor/config.json"
         if os.path.exists("/etc/servermonitor") and os.access("/etc/servermonitor", os.W_OK):
             return "/etc/servermonitor/config.json"
+        if os.path.exists("/var/lib/servermonitor") and os.access("/var/lib/servermonitor", os.W_OK):
+            return "/var/lib/servermonitor/config.json"
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
     def load(self):
@@ -163,11 +166,14 @@ class Config:
             dirname = os.path.dirname(os.path.abspath(self.config_file))
             if dirname and not os.path.exists(dirname):
                 os.makedirs(dirname, mode=0o700, exist_ok=True)
+            tmp_path = f"{self.config_file}.tmp.{os.getpid()}_{int(time.time() * 1000)}"
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            fd = os.open(self.config_file, flags, 0o600)
-            with open(fd, "w") as f:
+            fd = os.open(tmp_path, flags, 0o600)
+            with open(fd, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2)
-            os.chmod(self.config_file, 0o600)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.config_file)
             return True
         except Exception as e:
             sys.stderr.write(f"Error: Failed to save config to {self.config_file}: {e}\n")
@@ -237,6 +243,10 @@ class Config:
     def monitored_http_urls(self):
         return self.data.get("monitored_http_urls", self.DEFAULT_CONFIG["monitored_http_urls"])
 
+    @property
+    def allowed_hosts(self):
+        return self.data.get("allowed_hosts", self.DEFAULT_CONFIG.get("allowed_hosts", ["127.0.0.1", "localhost", "::1"]))
+
 
 # ============================================================
 # SECURITY & AUTHENTICATION
@@ -272,7 +282,7 @@ def extract_token(headers, path=""):
 def get_security_headers():
     """Returns strict security response headers."""
     return {
-        "Content-Security-Policy": "default-src 'self' 'unsafe-inline' data:; connect-src 'self' ws: wss:;",
+        "Content-Security-Policy": "default-src 'self' 'unsafe-inline' data:; connect-src 'self';",
         "X-Content-Type-Options": "nosniff",
         "X-Frame-Options": "DENY",
         "Referrer-Policy": "no-referrer",
@@ -298,10 +308,15 @@ class RateLimiter:
             # Capacity guard: prune expired entries if map grows large
             if len(self.clients) >= self.max_clients:
                 self._prune_unlocked(now)
-                # If still over limit, evict oldest entries
+                # If still over limit, evict oldest inactive entries (never currently throttled entries)
                 if len(self.clients) >= self.max_clients:
-                    keys_to_remove = list(self.clients.keys())[:max(1, self.max_clients // 5)]
-                    for k in keys_to_remove:
+                    candidates = []
+                    for k, ts in self.clients.items():
+                        if len(ts) < self.max_requests:
+                            candidates.append((ts[-1] if ts else 0, k))
+                    candidates.sort()
+                    evict_count = max(1, self.max_clients // 5)
+                    for _, k in candidates[:evict_count]:
                         del self.clients[k]
 
             timestamps = self.clients.get(client_ip, [])
@@ -468,10 +483,44 @@ def get_cpu_usage():
         return 0.0
 
 
+def get_container_cpu():
+    """Detect cgroup v1 and v2 CPU quota limits."""
+    container_cpu = {"active": False, "limit_cores": None}
+    if os.path.exists("/sys/fs/cgroup/cpu.max"):
+        try:
+            raw = read_file("/sys/fs/cgroup/cpu.max").strip().split()
+            if len(raw) >= 2 and raw[0] != "max":
+                quota = int(raw[0])
+                period = int(raw[1])
+                if period > 0:
+                    container_cpu = {
+                        "active": True,
+                        "limit_cores": round(quota / period, 2)
+                    }
+        except Exception:
+            pass
+    elif os.path.exists("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
+        try:
+            quota_raw = read_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").strip()
+            period_raw = read_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us").strip()
+            if quota_raw.isdigit() and period_raw.isdigit():
+                quota = int(quota_raw)
+                period = int(period_raw)
+                if quota > 0 and period > 0:
+                    container_cpu = {
+                        "active": True,
+                        "limit_cores": round(quota / period, 2)
+                    }
+        except Exception:
+            pass
+    return container_cpu
+
+
 def get_cpu_stats():
     """Universal CPU calculation including total usage, steal time, and per-core utilization."""
     global _previous_cpu_detailed
 
+    container_cpu = get_container_cpu()
     stat_lines = read_file("/proc/stat").splitlines()
     cpu_lines = [l for l in stat_lines if l.startswith("cpu")]
 
@@ -482,7 +531,8 @@ def get_cpu_stats():
             "cores": get_cpu_count(),
             "per_core": [],
             "model": get_cpu_model(),
-            "load": get_load()
+            "load": get_load(),
+            "container": container_cpu
         }
 
     parsed = {}
@@ -503,7 +553,8 @@ def get_cpu_stats():
             "cores": get_cpu_count(),
             "per_core": [],
             "model": get_cpu_model(),
-            "load": get_load()
+            "load": get_load(),
+            "container": container_cpu
         }
 
     current_snapshot = {}
@@ -555,7 +606,8 @@ def get_cpu_stats():
         "cores": len(per_core) or get_cpu_count(),
         "per_core": per_core,
         "model": get_cpu_model(),
-        "load": get_load()
+        "load": get_load(),
+        "container": container_cpu
     }
 
 
@@ -1107,6 +1159,21 @@ def get_systemd_services(units=None):
     return {"available": True, "units": results}
 
 
+class StrictRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Restricts redirects to http/https only and caps maximum redirect depth to 3."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlparse(newurl)
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise urllib.error.HTTPError(req.full_url, code, f"Forbidden redirect scheme: {parsed.scheme}", headers, fp)
+        count = getattr(req, "_redirect_count", 0) + 1
+        if count > 3:
+            raise urllib.error.HTTPError(req.full_url, code, "Maximum redirect limit (3) exceeded", headers, fp)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            new_req._redirect_count = count
+        return new_req
+
+
 def get_health_checks(endpoints=None):
     """Performs lightweight HTTP and TCP endpoint health checks."""
     global _global_config
@@ -1145,10 +1212,22 @@ def get_health_checks(endpoints=None):
                     "target": f"{host}:{port}"
                 })
         elif url:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme.lower() not in ("http", "https"):
+                results.append({
+                    "name": name,
+                    "status": "down",
+                    "error": f"Invalid URL scheme '{parsed.scheme}'; only http and https are permitted",
+                    "type": "http",
+                    "target": url
+                })
+                continue
+
             t_start = time.monotonic()
             try:
+                opener = urllib.request.build_opener(StrictRedirectHandler())
                 req = urllib.request.Request(url, headers={"User-Agent": "ServerMonitor/2.0-HealthCheck"})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=timeout) as resp:
                     latency = round((time.monotonic() - t_start) * 1000.0, 1)
                     code = resp.getcode()
                     results.append({
@@ -1172,9 +1251,16 @@ def get_health_checks(endpoints=None):
 
 
 def get_docker_containers():
-    """Inspects Docker and Podman containers in a strictly read-only manner."""
-    runtime = shutil.which("docker") or shutil.which("podman")
-    if not runtime:
+    """Inspects Docker and Podman containers in a strictly read-only manner with fallback."""
+    runtimes = []
+    d_bin = shutil.which("docker")
+    p_bin = shutil.which("podman")
+    if d_bin:
+        runtimes.append(d_bin)
+    if p_bin:
+        runtimes.append(p_bin)
+
+    if not runtimes:
         return {
             "available": False,
             "runtime": None,
@@ -1182,59 +1268,60 @@ def get_docker_containers():
             "containers": []
         }
 
-    bin_name = os.path.basename(runtime)
-    try:
-        proc = subprocess.run(
-            [runtime, "ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.State}}"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            shell=False
-        )
-        if proc.returncode != 0:
-            return {
-                "available": False,
-                "runtime": bin_name,
-                "error": proc.stderr.strip() or f"Exited with code {proc.returncode}",
-                "containers": []
-            }
-
-        containers = []
-        running = 0
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
+    last_error = ""
+    for runtime in runtimes:
+        bin_name = os.path.basename(runtime)
+        try:
+            proc = subprocess.run(
+                [runtime, "ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.State}}"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                shell=False
+            )
+            if proc.returncode != 0:
+                last_error = proc.stderr.strip() or f"Exited with code {proc.returncode}"
                 continue
-            parts = line.split("\t")
-            cid = parts[0] if len(parts) > 0 else ""
-            cname = parts[1] if len(parts) > 1 else ""
-            cimg = parts[2] if len(parts) > 2 else ""
-            cstatus = parts[3] if len(parts) > 3 else ""
-            cstate = parts[4] if len(parts) > 4 else ("running" if "Up" in cstatus else "exited")
-            if cstate.lower() == "running" or "Up" in cstatus:
-                running += 1
-            containers.append({
-                "id": cid[:12],
-                "name": cname,
-                "image": cimg,
-                "status": cstatus,
-                "state": cstate.lower()
-            })
 
-        return {
-            "available": True,
-            "runtime": bin_name,
-            "total": len(containers),
-            "running": running,
-            "containers": containers
-        }
-    except Exception as e:
-        return {
-            "available": False,
-            "runtime": bin_name,
-            "error": str(e),
-            "containers": []
-        }
+            containers = []
+            running = 0
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                cid = parts[0] if len(parts) > 0 else ""
+                cname = parts[1] if len(parts) > 1 else ""
+                cimg = parts[2] if len(parts) > 2 else ""
+                cstatus = parts[3] if len(parts) > 3 else ""
+                cstate = parts[4] if len(parts) > 4 else ("running" if "Up" in cstatus else "exited")
+                if cstate.lower() == "running" or "Up" in cstatus:
+                    running += 1
+                containers.append({
+                    "id": cid[:12],
+                    "name": cname,
+                    "image": cimg,
+                    "status": cstatus,
+                    "state": cstate.lower()
+                })
+
+            return {
+                "available": True,
+                "runtime": bin_name,
+                "total": len(containers),
+                "running": running,
+                "containers": containers
+            }
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return {
+        "available": False,
+        "runtime": os.path.basename(runtimes[0]),
+        "error": last_error or "Container runtime unavailable",
+        "containers": []
+    }
 
 
 def get_pm2_services():
@@ -1689,6 +1776,7 @@ class OnDemandCollector:
         self._thread = None
 
         self._cached_snapshot = None
+        self._last_sample_time = 0.0
         self._history = {
             "cpu": collections.deque(maxlen=self.history_maxlen),
             "memory": collections.deque(maxlen=self.history_maxlen),
@@ -1715,9 +1803,15 @@ class OnDemandCollector:
             session_id = "default"
         now = time.monotonic()
         with self._lock:
+            was_active = self._is_active
             self._active_sessions[session_id] = now
-            if not self._is_active:
+            if not was_active:
                 self._is_active = True
+                # Reset sampling baselines on wake so idle gap does not distort CPU/network rates
+                global _previous_cpu_detailed, _previous_network, _previous_sample_time
+                _previous_cpu_detailed = None
+                _previous_network = None
+                _previous_sample_time = None
                 self._wakeup_event.set()
 
     def unregister_session(self, session_id):
@@ -1745,29 +1839,34 @@ class OnDemandCollector:
                 "tx_rate": list(self._history["tx_rate"]),
             }
 
-    def _sample_locked(self):
-        """Samples metrics while holding self._lock. Thread-safe and race-free."""
+    def _sample(self):
+        """Samples metrics outside self._lock, then acquires lock briefly to store result."""
         snapshot = collect_system_metrics()
         mem_pct = snapshot.pop("mem_pct", 0.0)
-        snapshot["collector_state"] = self.get_state()
+        now = time.monotonic()
 
-        self._cached_snapshot = snapshot
-        self._history["cpu"].append(snapshot["cpu"])
-        self._history["memory"].append(mem_pct)
-        self._history["steal"].append(snapshot["cpu_details"]["steal"])
-        self._history["rx_rate"].append(snapshot["network"]["rx_rate"])
-        self._history["tx_rate"].append(snapshot["network"]["tx_rate"])
-
-    def _sample(self):
-        """Thread-safe sampling entrypoint."""
         with self._lock:
-            self._sample_locked()
+            snapshot["collector_state"] = self.get_state()
+            self._cached_snapshot = snapshot
+            self._last_sample_time = now
+            self._history["cpu"].append(snapshot["cpu"])
+            self._history["memory"].append(mem_pct)
+            self._history["steal"].append(snapshot["cpu_details"]["steal"])
+            self._history["rx_rate"].append(snapshot["network"]["rx_rate"])
+            self._history["tx_rate"].append(snapshot["network"]["tx_rate"])
 
     def get_snapshot(self):
+        now = time.monotonic()
+        need_sample = False
         with self._lock:
-            if self._cached_snapshot is None:
-                self._sample_locked()
-            res = dict(self._cached_snapshot)
+            if self._cached_snapshot is None or (self.is_active() and (now - self._last_sample_time > self.sample_interval)):
+                need_sample = True
+
+        if need_sample:
+            self._sample()
+
+        with self._lock:
+            res = dict(self._cached_snapshot) if self._cached_snapshot else {}
             res["collector_state"] = self.get_state()
             res["history"] = {
                 "cpu": list(self._history["cpu"]),
@@ -1788,6 +1887,10 @@ class OnDemandCollector:
                 self._wakeup_event.wait(timeout=None)
                 if self._stop_event.is_set():
                     break
+                # Woken up: if get_snapshot() already sampled recently on wakeup, wait for sample_interval before next sample
+                if time.monotonic() - self._last_sample_time < (self.sample_interval * 0.5):
+                    self._stop_event.wait(self.sample_interval)
+                    continue
 
             # Active sampling
             try:
@@ -3024,7 +3127,37 @@ class Handler(BaseHTTPRequestHandler):
         if local_ip:
             allowed.add(local_ip)
 
-        return hostname.lower() in {h.lower() for h in allowed}
+        hostname_lower = hostname.lower()
+
+        # Wildcard allow-all check
+        if "*" in custom_allowed or "*" in allowed:
+            return True
+
+        # Exact match
+        allowed_set = {h.lower() for h in allowed}
+        if hostname_lower in allowed_set:
+            return True
+
+        # Tailscale domain (*.ts.net) or CGNAT IP (100.64.0.0/10)
+        if hostname_lower.endswith(".ts.net"):
+            return True
+        if hostname.startswith("100."):
+            parts = hostname.split(".")
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                b1 = int(parts[0])
+                b2 = int(parts[1])
+                if b1 == 100 and (64 <= b2 <= 127):
+                    return True
+
+        # Subdomain / wildcard matching (e.g. *.example.com or .example.com)
+        for pattern in custom_allowed:
+            pat = pattern.lower()
+            if pat.startswith("*.") and hostname_lower.endswith(pat[1:]):
+                return True
+            if pat.startswith(".") and hostname_lower.endswith(pat):
+                return True
+
+        return False
 
     def get_client_ip(self):
         global _global_config
@@ -3272,6 +3405,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 
 # Sandboxed Writable State & Configuration Isolation
 StateDirectory=servermonitor
@@ -3305,7 +3441,6 @@ def run_interactive_setup(config_file=None):
     print("  ServerMonitor v2.0 - Universal Production Setup Wizard")
     print("=" * 64 + "\n")
 
-    current_dir = os.path.dirname(os.path.abspath(__file__))
     config = Config(config_file=config_file)
 
     # 1. Host and Port
@@ -3321,21 +3456,57 @@ def run_interactive_setup(config_file=None):
     # 2. Authentication
     print("\n[2/5] Access Security & Authentication")
     is_loopback = config.host in ("127.0.0.1", "localhost", "::1")
-    if not is_loopback:
-        print("  [!] Notice: Non-loopback interface selected.")
-        print("  [!] An access token is MANDATORY when binding to LAN or external interfaces.")
-        gen_token = secrets.token_hex(16)
-        token_input = input(f"  Enter access token or press enter to generate [{gen_token}]: ").strip()
-        config.auth_token = token_input or gen_token
-        print(f"  -> Authentication Token set: {config.auth_token}")
+    gen_token = secrets.token_hex(24)
+
+    # Reverse proxy / Domain check
+    rev_choice = input(f"  Will ServerMonitor be accessed via reverse proxy (Caddy/Nginx) or domain? [y/N]: ").strip().lower()
+    is_proxied = rev_choice in ("y", "yes")
+    if is_proxied:
+        dom_input = input(f"  Enter allowed domain or host pattern (e.g. monitor.example.com or *): ").strip()
+        if dom_input and dom_input not in config.data["allowed_hosts"]:
+            config.data["allowed_hosts"].append(dom_input)
+
+    if not is_loopback or is_proxied:
+        print("  [!] Notice: Non-loopback or reverse-proxied deployment detected.")
+        print(f"  [!] An access token (min {MIN_TOKEN_LENGTH} chars) is MANDATORY to prevent unauthorized access.")
+        while True:
+            try:
+                import getpass
+                token_input = getpass.getpass(f"  Enter access token (min {MIN_TOKEN_LENGTH} chars, or press Enter to generate): ").strip()
+            except Exception:
+                token_input = input(f"  Enter access token (min {MIN_TOKEN_LENGTH} chars, or press Enter to generate): ").strip()
+
+            if not token_input:
+                config.auth_token = gen_token
+                print(f"  -> Generated secure access token: {config.auth_token}")
+                break
+            elif len(token_input) < MIN_TOKEN_LENGTH:
+                print(f"  [!] Token too weak ({len(token_input)} chars). Minimum length is {MIN_TOKEN_LENGTH} characters.")
+            else:
+                config.auth_token = token_input
+                print("  -> Custom access token accepted.")
+                break
     else:
         print("  (Tip: A secret token protects your dashboard when accessible over LAN/WAN)")
-        gen_token = secrets.token_hex(16)
         auth_choice = input(f"  Set access token? [y/N]: ").strip().lower()
         if auth_choice in ("y", "yes"):
-            token_input = input(f"  Enter token or press enter to generate [{gen_token}]: ").strip()
-            config.auth_token = token_input or gen_token
-            print(f"  -> Authentication Token set: {config.auth_token}")
+            while True:
+                try:
+                    import getpass
+                    token_input = getpass.getpass(f"  Enter token (min {MIN_TOKEN_LENGTH} chars, or press Enter to generate): ").strip()
+                except Exception:
+                    token_input = input(f"  Enter token (min {MIN_TOKEN_LENGTH} chars, or press Enter to generate): ").strip()
+
+                if not token_input:
+                    config.auth_token = gen_token
+                    print(f"  -> Generated secure access token: {config.auth_token}")
+                    break
+                elif len(token_input) < MIN_TOKEN_LENGTH:
+                    print(f"  [!] Token too weak ({len(token_input)} chars). Minimum length is {MIN_TOKEN_LENGTH} characters.")
+                else:
+                    config.auth_token = token_input
+                    print("  -> Custom access token accepted.")
+                    break
         else:
             config.auth_token = ""
             print("  -> Running in tokenless mode (Recommended for localhost / SSH tunnel only).")
@@ -3390,15 +3561,14 @@ def run_interactive_setup(config_file=None):
 # ============================================================
 
 def run_benchmark():
-    """Benchmarks idle vs active memory and CPU footprint."""
+    """Benchmarks idle vs active memory and CPU footprint using os.times()."""
     print("\n" + "=" * 60)
     print("  ServerMonitor Performance & Resource Footprint Benchmark")
     print("=" * 60)
 
     pid = os.getpid()
     print(f"  Testing PID: {pid}")
-    print("  Measuring baseline idle footprint (5s sleep)...")
-    time.sleep(2.0)
+    print("  Measuring baseline idle footprint (2s sleep)...")
 
     # Read memory RSS from /proc/<pid>/status
     def get_rss_kb():
@@ -3410,19 +3580,37 @@ def run_benchmark():
             return 0
         return 0
 
+    t0_wall = time.monotonic()
+    t0_times = os.times()
+    time.sleep(2.0)
+    t1_wall = time.monotonic()
+    t1_times = os.times()
+
+    idle_wall = t1_wall - t0_wall
+    idle_cpu_time = (t1_times.user - t0_times.user) + (t1_times.system - t0_times.system)
+    idle_cpu_pct = (idle_cpu_time / idle_wall) * 100.0 if idle_wall > 0 else 0.0
+
     rss_idle = get_rss_kb() / 1024.0
     print(f"  Idle Memory RSS:    {rss_idle:.2f} MB")
+    print(f"  Idle CPU Usage:     {idle_cpu_pct:.2f}% (Event-driven sleeping)")
 
     # Simulate 50 status queries
     print("  Simulating 50 rapid telemetry sampling requests...")
-    t0 = time.monotonic()
+    t2_wall = time.monotonic()
+    t2_times = os.times()
     for _ in range(50):
         get_status(client_id="benchmark")
-    elapsed = time.monotonic() - t0
+    t3_wall = time.monotonic()
+    t3_times = os.times()
+
+    active_wall = t3_wall - t2_wall
+    active_cpu_time = (t3_times.user - t2_times.user) + (t3_times.system - t2_times.system)
+    active_cpu_pct = (active_cpu_time / active_wall) * 100.0 if active_wall > 0 else 0.0
 
     rss_active = get_rss_kb() / 1024.0
     print(f"  Active Memory RSS:  {rss_active:.2f} MB (Delta: +{(rss_active - rss_idle):.2f} MB)")
-    print(f"  50 Samples Time:    {elapsed:.3f} s ({elapsed / 50.0 * 1000:.2f} ms/query)")
+    print(f"  Active CPU Usage:   {active_cpu_pct:.2f}%")
+    print(f"  50 Samples Time:    {active_wall:.3f} s ({active_wall / 50.0 * 1000:.2f} ms/query)")
     print("  Zero-dependency verification: Pure Python standard library only.")
     print("=" * 60 + "\n")
 
@@ -3460,9 +3648,12 @@ def main():
 
     if args.tunnel:
         port = args.port or DEFAULT_PORT
+        tunnel_host = args.host or get_local_ip()
         print("\nReady-to-use SSH Port Forwarding Command:")
-        print("  " + generate_ssh_tunnel_command(port=port))
-        print(f"\nThen visit: http://127.0.0.1:{port} in your local browser.\n")
+        print("  " + generate_ssh_tunnel_command(port=port, host=tunnel_host))
+        print("\nTip: If accessing a remote cloud VM (GCP, AWS, OCI), provide your public IP/hostname:")
+        print(f"  servermonitor tunnel --host <cloud-ip> --port {port}\n")
+        print(f"Then open http://127.0.0.1:{port} in your local browser.\n")
         return
 
     if args.generate_systemd:
@@ -3480,7 +3671,9 @@ def main():
         test_host = args.host or cfg.host or "127.0.0.1"
         token = args.token or cfg.auth_token or ""
 
-        url = f"http://{test_host}:{test_port}/api/config"
+        # Properly format IPv6 addresses in URLs
+        formatted_host = f"[{test_host}]" if ":" in test_host and not test_host.startswith("[") else test_host
+        url = f"http://{formatted_host}:{test_port}/api/config"
         headers = {"User-Agent": f"ServerMonitor/{VERSION}-CLI"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -3491,23 +3684,23 @@ def main():
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
                 auth_str = " (Authenticated)" if token else ""
-                print(f"[✓] ServerMonitor is running on http://{test_host}:{test_port}{auth_str} (v{data.get('version', VERSION)})")
+                print(f"[✓] ServerMonitor is running on http://{formatted_host}:{test_port}{auth_str} (v{data.get('version', VERSION)})")
                 return
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 if token:
-                    print(f"[!] ServerMonitor is running on http://{test_host}:{test_port}, but provided token was rejected (HTTP {e.code}).")
+                    print(f"[!] ServerMonitor is running on http://{formatted_host}:{test_port}, but provided token was rejected (HTTP {e.code}).")
                 else:
-                    print(f"[✓] ServerMonitor is running on http://{test_host}:{test_port} (Protected - HTTP {e.code} Unauthorized). Use --token <secret> to authenticate.")
+                    print(f"[✓] ServerMonitor is running on http://{formatted_host}:{test_port} (Protected - HTTP {e.code} Unauthorized). Use --token <secret> to authenticate.")
                 return
             else:
-                print(f"[!] ServerMonitor returned HTTP {e.code} on http://{test_host}:{test_port}")
+                print(f"[!] ServerMonitor returned HTTP {e.code} on http://{formatted_host}:{test_port}")
                 sys.exit(1)
         except urllib.error.URLError as e:
-            print(f"[✗] ServerMonitor is not running or unreachable on http://{test_host}:{test_port} ({e.reason})")
+            print(f"[✗] ServerMonitor is not running or unreachable on http://{formatted_host}:{test_port} ({e.reason})")
             sys.exit(1)
         except Exception as e:
-            print(f"[✗] Error connecting to ServerMonitor on http://{test_host}:{test_port}: {e}")
+            print(f"[✗] Error connecting to ServerMonitor on http://{formatted_host}:{test_port}: {e}")
             sys.exit(1)
 
     # Load configuration
@@ -3522,17 +3715,31 @@ def main():
     HOST = _global_config.host
     PORT = _global_config.port
 
-    # Remote access security check: reject non-loopback binding without authentication
-    is_loopback = HOST in ("127.0.0.1", "localhost", "::1")
-    if not is_loopback and not _global_config.auth_token:
+    if args.token and len(args.token) < MIN_TOKEN_LENGTH:
         sys.stderr.write(
-            f"Security Error: ServerMonitor is configured to bind to non-loopback interface '{HOST}' "
-            f"without authentication enabled.\n"
-            f"Binding to external or LAN interfaces without an access token is rejected for security.\n"
-            f"Please specify an authentication token with --token <secret> or configure 'auth_token' in config.json.\n"
-            f"Alternatively, bind to 127.0.0.1 (default) and access via SSH tunnel or reverse proxy.\n"
+            f"Security Error: Provided token is too weak ({len(args.token)} characters). "
+            f"Tokens must be at least {MIN_TOKEN_LENGTH} characters long.\n"
         )
         sys.exit(1)
+
+    # Remote access security check: reject non-loopback binding without authentication
+    is_loopback = HOST in ("127.0.0.1", "localhost", "::1")
+    if not is_loopback:
+        if not _global_config.auth_token:
+            sys.stderr.write(
+                f"Security Error: ServerMonitor is configured to bind to non-loopback interface '{HOST}' "
+                f"without authentication enabled.\n"
+                f"Binding to external or LAN interfaces without an access token is rejected for security.\n"
+                f"Please specify an authentication token with --token <secret> or configure 'auth_token' in config.json.\n"
+                f"Alternatively, bind to 127.0.0.1 (default) and access via SSH tunnel or reverse proxy.\n"
+            )
+            sys.exit(1)
+        if len(_global_config.auth_token) < MIN_TOKEN_LENGTH:
+            sys.stderr.write(
+                f"Security Error: Configured authentication token is too weak ({len(_global_config.auth_token)} characters). "
+                f"Tokens must be at least {MIN_TOKEN_LENGTH} characters for non-loopback bindings.\n"
+            )
+            sys.exit(1)
 
     # Start On-Demand Collector
     _global_collector = OnDemandCollector(

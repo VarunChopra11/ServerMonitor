@@ -92,7 +92,7 @@ The interactive wizard guides you through:
 3. **Security Token**: Generate a secure 32-character random access token or set custom credentials.
 4. **Sampling & Conservation**: Configure the 2-second live sampling cadence and inactivity pause timeout.
 5. **Deployment**: Standalone CLI, PM2 process, or systemd daemon.
-6. **Remote Access**: Generates tailored SSH port forwarding commands, Tailscale configuration instructions, and Caddy/Nginx reverse proxy blocks.
+6. **Remote Access**: Generates tailored SSH port forwarding commands and guides Tailscale, Caddy, and Nginx configurations.
 
 ---
 
@@ -188,10 +188,27 @@ Open `http://127.0.0.1:8080` in your local computer's browser. Traffic is end-to
 If using [Tailscale](https://tailscale.com):
 1. Install Tailscale: `curl -fsSL https://tailscale.com/install.sh | sh`
 2. Connect the node: `tailscale up`
-3. In `config.json`, bind `host` to your node's 100.x.y.z Tailscale IP or `0.0.0.0` with token authentication.
+3. In `config.json`, set your authentication token and add your Tailscale IP/domain to `allowed_hosts`:
+   ```json
+   {
+     "auth_token": "your-secret-token-min-24-chars",
+     "allowed_hosts": ["127.0.0.1", "localhost", "100.*", "*.ts.net"]
+   }
+   ```
 4. Access via your private Tailnet URL: `http://100.x.y.z:8080`
 
 ### 3. HTTPS via Caddy (Automatic SSL)
+
+> [!NOTE]
+> When accessing ServerMonitor behind a reverse proxy, an `auth_token` is **strictly required**. Add your domain name to `allowed_hosts` in `config.json` so that the Host-header validation accepts proxied traffic.
+
+In `config.json`:
+```json
+{
+  "auth_token": "your-secret-token-min-24-chars",
+  "allowed_hosts": ["127.0.0.1", "localhost", "monitor.yourdomain.com"]
+}
+```
 
 Add to `/etc/caddy/Caddyfile`:
 
@@ -328,20 +345,20 @@ Typical benchmark results on ARM64 and x86_64 Linux:
 | **Memory (RSS) - Active** | **~29.2 MB** | 2-second background telemetry sampling |
 | **CPU Usage - Idle** | **0.0%** | Event-driven sleep when no browser tab open |
 | **CPU Usage - Active** | **< 0.2%** | Delta calculations in pure Python standard library |
-| **Average Query Latency** | **~0.6 ms** | Served from atomic thread-safe memory snapshot |
+| **Average Query Latency (Cached)** | **~0.6 ms** | Served from atomic in-memory snapshot (~60 ms for full cold hardware sweep) |
 | **External Dependencies** | **0** | No pip, npm, wheels, or compiled binary dependencies |
 
 ---
 
 ## Running the Unit & Integration Test Suite
 
-A comprehensive test suite of 60 tests verifies hardware discovery, cgroups, collector lifecycle, security, CLI, and live HTTP operations:
+A comprehensive test suite of 105+ tests verifies hardware discovery, cgroups, collector lifecycle, security, CLI, real script execution, and live HTTP operations:
 
 ```bash
 python3 -m unittest discover -v
 ```
 
-All 60 tests run in under 3 seconds with zero external dependencies.
+All tests run in under 4 seconds with zero external dependencies.
 
 ---
 
@@ -354,9 +371,9 @@ To safely stop ServerMonitor and clean up its files without touching other proje
 ```
 
 The uninstaller:
-1. Stops and deletes the systemd service (if registered).
-2. Stops and removes the PM2 process (if registered).
-3. Safely prompts before removing `config.json` and installation files.
+1. Stops and removes the systemd service (if registered).
+2. Stops and removes the PM2 process (if registered) and saves process list via `pm2 save`.
+3. Safely prompts before removing system state/config directories (`/var/lib/servermonitor`, `/etc/servermonitor`) and local configuration files.
 
 ---
 

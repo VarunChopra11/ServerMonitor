@@ -72,12 +72,14 @@ class TestServicesMonitoring(unittest.TestCase):
         self.assertEqual(procs["postgres"]["count"], 0)
 
     @patch("server.socket.create_connection")
-    @patch("server.urllib.request.urlopen")
-    def test_http_and_tcp_health_checks(self, mock_urlopen, mock_socket):
+    @patch("server.urllib.request.build_opener")
+    def test_http_and_tcp_health_checks(self, mock_build_opener, mock_socket):
         # Mock HTTP response
         mock_resp = MagicMock()
         mock_resp.getcode.return_value = 200
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
+        mock_opener = MagicMock()
+        mock_opener.open.return_value.__enter__.return_value = mock_resp
+        mock_build_opener.return_value = mock_opener
 
         # Mock TCP connection
         mock_socket.return_value.__enter__.return_value = MagicMock()

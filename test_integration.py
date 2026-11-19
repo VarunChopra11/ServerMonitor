@@ -28,12 +28,12 @@ class TestIntegrationLiveServer(unittest.TestCase):
         cls.config.port = cls.test_port
         cls.config.auth_token = cls.test_token
         cls.config.data["sample_interval"] = 0.5
-        cls.config.data["inactivity_timeout"] = 1.0
+        cls.config.data["inactivity_timeout"] = 5.0
 
         server._global_config = cls.config
 
         # Initialize collector
-        cls.collector = server.OnDemandCollector(sample_interval=0.5, inactivity_timeout=1.0)
+        cls.collector = server.OnDemandCollector(sample_interval=0.5, inactivity_timeout=5.0)
         cls.collector.start()
         server._global_collector = cls.collector
 
