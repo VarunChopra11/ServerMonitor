@@ -56,6 +56,14 @@ SAMPLE_AGY_OUTPUT = {
 }
 
 class TestLlmUsageBackend(unittest.TestCase):
+    def setUp(self):
+        self.old_config = server._global_config
+        cfg = server.Config()
+        cfg.data["modules"]["antigravity"] = True
+        server._global_config = cfg
+
+    def tearDown(self):
+        server._global_config = self.old_config
 
     @patch("server.subprocess.run")
     def test_run_llm_usage_success(self, mock_run):
