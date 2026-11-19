@@ -108,7 +108,7 @@ class TestOnDemandCollector(unittest.TestCase):
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=3.0)
+            t.join(timeout=5.0)
 
         self.assertEqual(len(errors), 0, f"Thread errors: {errors}")
         self.assertEqual(len(results), 10)

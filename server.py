@@ -1771,6 +1771,7 @@ class OnDemandCollector:
 
         self._active_sessions = {}
         self._lock = threading.RLock()
+        self._sampling_lock = threading.Lock()
         self._wakeup_event = threading.Event()
         self._stop_event = threading.Event()
         self._thread = None
@@ -1863,7 +1864,13 @@ class OnDemandCollector:
                 need_sample = True
 
         if need_sample:
-            self._sample()
+            with self._sampling_lock:
+                recheck = False
+                with self._lock:
+                    if self._cached_snapshot is None or (self.is_active() and (time.monotonic() - self._last_sample_time > self.sample_interval)):
+                        recheck = True
+                if recheck:
+                    self._sample()
 
         with self._lock:
             res = dict(self._cached_snapshot) if self._cached_snapshot else {}
@@ -1894,7 +1901,8 @@ class OnDemandCollector:
 
             # Active sampling
             try:
-                self._sample()
+                with self._sampling_lock:
+                    self._sample()
             except Exception as e:
                 sys.stderr.write(f"Collector sampling error: {e}\n")
 
