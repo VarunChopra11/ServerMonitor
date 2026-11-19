@@ -112,6 +112,22 @@ class TestLlmUsageBackend(unittest.TestCase):
         self.assertIn("Permission denied", result["error"])
 
     @patch("server.subprocess.run")
+    def test_run_llm_usage_plain_text_fallback(self, mock_run):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "Gemini Models\tWeekly Limit Remaining\t67.2%\t2026-11-25T13:46:29Z\nGemini Models\tFive Hour Limit Remaining\t99.0%\t2026-11-19T16:28:21Z\n"
+        mock_proc.stderr = ""
+        mock_run.return_value = mock_proc
+
+        result = server.run_llm_usage()
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(result["groups"]), 1)
+        self.assertEqual(result["groups"][0]["name"], "Gemini Models")
+        self.assertEqual(len(result["groups"][0]["buckets"]), 2)
+        self.assertEqual(result["groups"][0]["buckets"][0]["percentage"], 67.2)
+
+    @patch("server.subprocess.run")
     def test_run_llm_usage_malformed_json(self, mock_run):
         mock_proc = MagicMock()
         mock_proc.returncode = 0

@@ -9,7 +9,7 @@ import server
 class TestCliAndConfig(unittest.TestCase):
 
     def test_default_config(self):
-        cfg = server.Config()
+        cfg = server.Config(config_file="/nonexistent/config.json")
         self.assertEqual(cfg.host, "127.0.0.1")
         self.assertEqual(cfg.port, 8080)
         self.assertEqual(cfg.auth_token, "")

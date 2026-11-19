@@ -1553,7 +1553,7 @@ def run_llm_usage():
             env["HOME"] = user_home
 
         proc = subprocess.run(
-            [agy_bin, "-p", "/usage"],
+            [agy_bin, "--output-format", "json", "-p", "/usage"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1564,28 +1564,59 @@ def run_llm_usage():
             result["error"] = proc.stderr.strip() or f"agy exited with code {proc.returncode}"
             return result
 
-        raw = json.loads(proc.stdout)
-        cmd_data = raw.get("command", {}).get("data", {})
-        groups = cmd_data.get("groups", [])
-
         formatted_groups = []
-        for g in groups:
-            g_name = g.get("name", "Unknown Group")
-            buckets = []
-            for b in g.get("buckets", []):
-                b_name = b.get("name", b.get("id", "Limit"))
-                rem_frac = b.get("remaining_fraction", 0.0)
-                pct = round(rem_frac * 100, 1)
-                reset_time = b.get("reset_time", "")
-                buckets.append({
-                    "name": b_name,
-                    "percentage": pct,
-                    "reset_time": reset_time
+        try:
+            raw = json.loads(proc.stdout)
+            cmd_data = raw.get("command", {}).get("data", {})
+            groups = cmd_data.get("groups", [])
+            for g in groups:
+                g_name = g.get("name", "Unknown Group")
+                buckets = []
+                for b in g.get("buckets", []):
+                    b_name = b.get("name", b.get("id", "Limit"))
+                    rem_frac = b.get("remaining_fraction", 0.0)
+                    pct = round(rem_frac * 100, 1)
+                    reset_time = b.get("reset_time", "")
+                    buckets.append({
+                        "name": b_name,
+                        "percentage": pct,
+                        "reset_time": reset_time
+                    })
+                formatted_groups.append({
+                    "name": g_name,
+                    "buckets": buckets
                 })
-            formatted_groups.append({
-                "name": g_name,
-                "buckets": buckets
-            })
+        except (json.JSONDecodeError, AttributeError):
+            # Fallback parser for plain text tab-separated output from agy
+            lines = [l.strip() for l in proc.stdout.strip().splitlines() if l.strip()]
+            groups_dict = collections.OrderedDict()
+            for line in lines:
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    g_name = parts[0].strip()
+                    b_name = parts[1].strip()
+                    pct_str = parts[2].strip().rstrip("%")
+                    try:
+                        pct = float(pct_str)
+                    except ValueError:
+                        pct = 0.0
+                    reset_time = parts[3].strip() if len(parts) >= 4 else ""
+                    if g_name not in groups_dict:
+                        groups_dict[g_name] = []
+                    groups_dict[g_name].append({
+                        "name": b_name,
+                        "percentage": pct,
+                        "reset_time": reset_time
+                    })
+            for g_name, buckets in groups_dict.items():
+                formatted_groups.append({
+                    "name": g_name,
+                    "buckets": buckets
+                })
+
+        if not formatted_groups:
+            result["error"] = "Failed to parse Antigravity output"
+            return result
 
         result["groups"] = formatted_groups
         result["success"] = True
